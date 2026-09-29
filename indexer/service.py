@@ -11,10 +11,13 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from .config import IndexerConfig
 from .errors import (MalformedPayloadError, ReorgTooDeepError,
                      StateConflictError)
-from .models import Block, BlockStatus, IngestResult
+from .models import (BatchIngestResult, Block, BlockStatus, IngestResult,
+                     ReorgEvent)
 from .store import Store
 
 
@@ -95,15 +98,44 @@ class IngestService:
                         "max_reorg_depth": self._config.max_reorg_depth},
             )
 
+        # 切换前先快照新链各块的旧状态，用于区分“首次接纳”与“重新接纳”
+        adopted: list[str] = []
+        readopted: list[str] = []
+        for b in chain:
+            old_entry = self._store.get_block(b.block_hash)
+            assert old_entry is not None
+            if old_entry[1] == BlockStatus.REORGED:
+                readopted.append(b.block_hash)
+            adopted.append(b.block_hash)
+
         # 旧规范链分叉点以上 -> REORGED（其交易随区块一并失去规范归属）
+        replaced: list[str] = []
         if tip is not None:
             for h in range(fork_height + 1, tip.height + 1):
                 for old in self._store.blocks_at_height(h, BlockStatus.CANONICAL):
                     self._store.set_block_status(old.block_hash, BlockStatus.REORGED)
+                    replaced.append(old.block_hash)
         # 新链 -> CANONICAL
         for b in chain:
             self._store.set_block_status(b.block_hash, BlockStatus.CANONICAL)
         self._store.advance_progress(blk.height)
+
+        # 只有真实“切换”（有原规范块被换下）才记审计；纯延长链不算切换。
+        # 与上面的状态翻转处在同一事务内：任一步失败本记录随状态一起回滚。
+        if tip is not None and replaced:
+            self._store.insert_reorg_event(ReorgEvent(
+                id=0,
+                occurred_at=datetime.now(timezone.utc).isoformat(),
+                depth=depth,
+                old_tip_hash=tip.block_hash,
+                old_tip_height=tip.height,
+                new_tip_hash=blk.block_hash,
+                new_tip_height=blk.height,
+                fork_height=fork_height,
+                replaced_hashes=tuple(replaced),
+                adopted_hashes=tuple(adopted),
+                readopted_hashes=tuple(readopted),
+            ))
         return depth
 
     def _try_connect_children(self, parent_hash: str) -> int:
@@ -127,46 +159,50 @@ class IngestService:
     def ingest_block(self, block: Block) -> IngestResult:
         """摄取单个区块：幂等、可暂存、可触发重组；失败整体回滚。"""
         self._validate(block)
-        with self._store.transaction():
-            existing = self._store.get_block(block.block_hash)
-            if existing is not None:
-                if existing[0] != block:
-                    raise StateConflictError(
-                        f"block {block.block_hash} 已存在但内容不一致",
-                        detail={"block_hash": block.block_hash},
-                    )
-                # 重复投递：幂等返回当前状态，不写新数据
-                return IngestResult(block.block_hash, existing[1], applied=False)
+        with self._store.transaction(timeout=self._config.lock_timeout):
+            return self._ingest_block_unlocked(block)
 
-            parent = self._store.get_block(block.parent_hash)
-            if block.height == 0:
-                if (self._config.genesis_hash
-                        and block.block_hash != self._config.genesis_hash):
-                    raise MalformedPayloadError(
-                        "创世块哈希与配置不符",
-                        detail={"block_hash": block.block_hash,
-                                "expected": self._config.genesis_hash},
-                    )
-            elif parent is None:
-                # 父块缺失：暂存，不丢数据也不入库为规范数据
-                self._store.upsert_block(block, BlockStatus.STAGED)
-                return IngestResult(block.block_hash, BlockStatus.STAGED,
-                                    applied=True)
-            else:
-                if parent[0].height + 1 != block.height:
-                    raise MalformedPayloadError(
-                        "区块高度与父块不连续",
-                        detail={"block_hash": block.block_hash,
-                                "height": block.height,
-                                "parent_height": parent[0].height},
-                    )
+    def _ingest_block_unlocked(self, block: Block) -> IngestResult:
+        """调用方须已持有写事务（顶层事务或批次内的 SAVEPOINT）。"""
+        existing = self._store.get_block(block.block_hash)
+        if existing is not None:
+            if existing[0] != block:
+                raise StateConflictError(
+                    f"block {block.block_hash} 已存在但内容不一致",
+                    detail={"block_hash": block.block_hash},
+                )
+            # 重复投递：幂等返回当前状态，不写新数据
+            return IngestResult(block.block_hash, existing[1], applied=False)
 
+        parent = self._store.get_block(block.parent_hash)
+        if block.height == 0:
+            if (self._config.genesis_hash
+                    and block.block_hash != self._config.genesis_hash):
+                raise MalformedPayloadError(
+                    "创世块哈希与配置不符",
+                    detail={"block_hash": block.block_hash,
+                            "expected": self._config.genesis_hash},
+                )
+        elif parent is None:
+            # 父块缺失：暂存，不丢数据也不入库为规范数据
             self._store.upsert_block(block, BlockStatus.STAGED)
-            depth = self._connect(block.block_hash)
-            depth = max(depth, self._try_connect_children(block.block_hash))
-            final_status = self._store.get_block(block.block_hash)[1]  # type: ignore[index]
-            return IngestResult(block.block_hash, final_status,
-                                applied=True, reorg_depth=depth)
+            return IngestResult(block.block_hash, BlockStatus.STAGED,
+                                applied=True)
+        else:
+            if parent[0].height + 1 != block.height:
+                raise MalformedPayloadError(
+                    "区块高度与父块不连续",
+                    detail={"block_hash": block.block_hash,
+                            "height": block.height,
+                            "parent_height": parent[0].height},
+                )
+
+        self._store.upsert_block(block, BlockStatus.STAGED)
+        depth = self._connect(block.block_hash)
+        depth = max(depth, self._try_connect_children(block.block_hash))
+        final_status = self._store.get_block(block.block_hash)[1]  # type: ignore[index]
+        return IngestResult(block.block_hash, final_status,
+                            applied=True, reorg_depth=depth)
 
     def canonical_chain(self) -> list[Block]:
         """按高度升序返回当前规范链。"""
@@ -174,3 +210,30 @@ class IngestService:
             self._store.list_blocks(BlockStatus.CANONICAL),
             key=lambda item: item[0].height,
         )]
+
+    def ingest_blocks_atomic(self, blocks: list[Block]) -> BatchIngestResult:
+        """整批原子摄取。
+
+        - 整批在一个顶层事务内逐块处理（逐块复用幂等/暂存/重组逻辑）；
+        - 任一块因畸形/内容冲突/重组过深被拒，异常传出顶层事务，整批回滚，
+          不会出现前半批已入库、后半批缺失的部分应用；
+        - 批内重复投递与单块语义一致：幂等，applied=False，不算失败；
+        - 等写锁超过 ``config.lock_timeout`` 秒抛 LockBusyError（可重试）。
+        """
+        # 先做不涉及存储的廉价校验，避免无意义地占用写锁
+        for block in blocks:
+            self._validate(block)
+
+        results: list[IngestResult] = []
+        accepted = 0
+        duplicates = 0
+        with self._store.transaction(timeout=self._config.lock_timeout):
+            for block in blocks:
+                result = self._ingest_block_unlocked(block)
+                results.append(result)
+                if result.applied:
+                    accepted += 1
+                else:
+                    duplicates += 1
+        return BatchIngestResult(accepted=accepted, duplicates=duplicates,
+                                 results=tuple(results))

@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from indexer.config import IndexerConfig
 from indexer.errors import IngestError
+from indexer.healthcheck import HealthChecker
 from indexer.models import Block, BlockStatus, Transaction
 from indexer.service import IngestService
 from indexer.source import LocalChainSource
@@ -21,6 +22,8 @@ _CATEGORY_STATUS = {
     "source_unavailable": 503,
     "state_conflict": 409,
     "reorg_too_deep": 422,
+    "lock_busy": 503,
+    "storage_error": 500,
     "internal": 500,
 }
 
@@ -74,15 +77,32 @@ def _block_view(block: Block, status: BlockStatus) -> dict:
     }
 
 
+def _reorg_view(event) -> dict:
+    return {
+        "id": event.id, "occurred_at": event.occurred_at,
+        "depth": event.depth,
+        "old_tip": {"block_hash": event.old_tip_hash,
+                    "height": event.old_tip_height},
+        "new_tip": {"block_hash": event.new_tip_hash,
+                    "height": event.new_tip_height},
+        "fork_height": event.fork_height,
+        "replaced_hashes": list(event.replaced_hashes),
+        "adopted_hashes": list(event.adopted_hashes),
+        "readopted_hashes": list(event.readopted_hashes),
+    }
+
+
 def create_app(config: IndexerConfig | None = None,
                source: LocalChainSource | None = None) -> FastAPI:
     config = config or IndexerConfig(
         max_reorg_depth=int(os.environ.get("INDEXER_MAX_REORG_DEPTH", "6")),
         genesis_hash=os.environ.get("INDEXER_GENESIS_HASH", ""),
         db_path=os.environ.get("INDEXER_DB_PATH", ":memory:"),
+        lock_timeout=float(os.environ.get("INDEXER_LOCK_TIMEOUT", "5.0")),
     )
     store = Store(config.db_path)
     service = IngestService(store, config)
+    checker = HealthChecker(store)
     if source is None and os.environ.get("INDEXER_SOURCE_PATH"):
         source = LocalChainSource(os.environ["INDEXER_SOURCE_PATH"])
 
@@ -127,6 +147,32 @@ def create_app(config: IndexerConfig | None = None,
                                "error": {"category": exc.category,
                                          "message": exc.message}})
         return {"results": outcomes}
+
+    @app.post("/ingest/batch")
+    def ingest_batch(payload: BatchIn):
+        """整批原子摄取：任一块被拒则整批不落库；批内重复按幂等处理。"""
+        result = service.ingest_blocks_atomic(
+            [item.to_block() for item in payload.blocks])
+        return {"accepted": result.accepted, "duplicates": result.duplicates,
+                "results": [{"block_hash": r.block_hash,
+                             "status": r.status.value, "applied": r.applied,
+                             "reorg_depth": r.reorg_depth}
+                            for r in result.results]}
+
+    # ---- 审计与自检 ----
+    @app.get("/reorgs")
+    def list_reorgs(limit: int = 50):
+        """按时间倒序翻阅规范链切换审计记录。"""
+        events = store.list_reorg_events(limit=limit)
+        return {"reorgs": [_reorg_view(e) for e in events]}
+
+    @app.get("/health/check")
+    def health_check():
+        """只读自检：分项返回结论与可定位的问题清单。"""
+        report = checker.run()
+        return {"ok": report.ok, "checks": [
+            {"name": c.name, "ok": c.ok, "issues": list(c.issues)}
+            for c in report.checks]}
 
     @app.post("/ingest/from-source")
     def ingest_from_source():

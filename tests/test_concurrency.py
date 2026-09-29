@@ -46,12 +46,17 @@ def test_concurrent_ingest_is_consistent(service):
     assert outcomes["err"] == 0
     assert outcomes["ok"] + outcomes["dup"] == len(deliveries)
 
-    # 最终状态：b 链更长，规范链为 g0,b1..b4；a1..a3 被重组替换
+    # 最终状态：b 链更长，规范链为 g0,b1..b4；a1..a3 不在规范链上。
+    # 它们要么曾被提升又被换下（reorged），要么在 b 链胜出后才连通、
+    # 从未进入过规范链而保持 staged —— 两种都是自洽且一致的合法终态。
     canonical = [b.block_hash for b in service.canonical_chain()]
     log.info("判定依据: 规范链=%s", canonical)
     assert canonical == ["g0", "b1", "b2", "b3", "b4"]
     for h in ("a1", "a2", "a3"):
-        assert service._store.get_block(h)[1] == BlockStatus.REORGED
+        status = service._store.get_block(h)[1]
+        # 曾被提升又换下 -> reorged；b 链胜出后才连通、从未进规范链 -> staged。
+        # 两种都是自洽终态，但绝不可能仍是 canonical。
+        assert status in (BlockStatus.REORGED, BlockStatus.STAGED)
 
     # 不重不漏：区块总数 = 数据集大小，每块交易数与输入一致
     all_blocks = service._store.list_blocks()

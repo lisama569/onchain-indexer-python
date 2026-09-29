@@ -17,3 +17,5 @@ class IndexerConfig:
     max_reorg_depth: int = 6
     genesis_hash: str = ""
     db_path: str = ":memory:"
+    # 并发批量提交等待写锁的最长秒数；超时按 lock_busy（可重试）返回
+    lock_timeout: float = 5.0
