@@ -3,19 +3,33 @@
 基于 FastAPI 的链上数据索引服务。使用本地固定 JSON 数据模拟链上数据源，
 在**链重组、重复投递、乱序到达与并发写入**下保证索引结果一致且可解释。
 
+近期新增面向**长期运行与排障**的三项能力：
+
+- **规范链切换审计**：每次重组切换都落一条可倒序查询的记录，与状态切换
+  同事务同生共死（切换失败不留痕、重复投递不重复记账）。
+- **只读自检**：`GET /health` 分项给出自洽性结论，把问题定位到具体的
+  块/交易；只读、且在一致性快照上执行，读不到改了一半的中间状态。
+- **整批原子摄取**：`POST /ingest/blocks/atomic` 一批区块要么全部生效、
+  要么整体回滚；等锁有上限，超时按可重试故障分类返回。
+
 ## 架构
 
 ```
 main.py              FastAPI 入口与路由（create_app 工厂便于测试注入配置）
 indexer/
-  config.py          IndexerConfig：max_reorg_depth / genesis_hash / db_path
-  models.py          Block / Transaction / BlockStatus / IngestResult
+  config.py          IndexerConfig：max_reorg_depth / genesis_hash /
+                     db_path / lock_timeout
+  models.py          Block / Transaction / BlockStatus / IngestResult /
+                     ReorgAuditRecord / BatchIngestResult / StoreSnapshot
   errors.py          失败分类：malformed_payload / source_unavailable /
-                     state_conflict / reorg_too_deep
-  store.py           SQLite 存储（区块、交易、状态、进度），写锁 + 事务
-  service.py         摄取、暂存连接、规范链维护、重组、进度推进
+                     state_conflict / reorg_too_deep / lock_timeout /
+                     storage_error
+  store.py           SQLite 存储（区块、交易、状态、进度、重组审计），
+                     写锁 + 事务（支持保存点嵌套、锁等待超时、一致性快照）
+  service.py         摄取、暂存连接、规范链维护、重组、审计、整批原子摄取
+  health.py          HealthChecker：只读分项自检
   source.py          LocalChainSource：本地固定 JSON 数据源
-tests/               基于固定数据的重组/重复/乱序/并发/畸形/回退测试
+tests/               重组/重复/乱序/并发/畸形/回退 + 审计/自检/整批原子测试
 ```
 
 ## 摄取协议
@@ -25,12 +39,15 @@ tests/               基于固定数据的重组/重复/乱序/并发/畸形/回
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/ingest/block` | 摄取单个区块，成功返回 `{status, applied, reorg_depth}` |
-| POST | `/ingest/blocks` | 批量摄取，逐块独立事务，逐块返回结果或分类错误 |
+| POST | `/ingest/blocks` | 批量摄取，**逐块独立事务**，逐块返回结果或分类错误（不因一块失败而回滚其它块） |
+| POST | `/ingest/blocks/atomic` | **整批原子摄取**，一批全有或全无；批内重复按幂等处理 |
 | POST | `/ingest/from-source` | 从本地数据源（`INDEXER_SOURCE_PATH`）按高度顺序拉取并摄取 |
 | GET | `/blocks?status=canonical\|reorged\|staged` | 按状态查询区块（含交易） |
 | GET | `/blocks/{block_hash}` | 区块详情 |
 | GET | `/chain/canonical` | 当前规范链（哈希按高度升序） |
 | GET | `/progress` | 摄取进度（规范链最高高度） |
+| GET | `/reorgs/audits?limit=&offset=` | 规范链切换审计，**按时间倒序**，可分页 |
+| GET | `/health` | 只读自检，返回分项结论与可定位的问题清单 |
 
 区块负载：
 
@@ -72,6 +89,85 @@ tests/               基于固定数据的重组/重复/乱序/并发/畸形/回
 - 所有多步写入包裹在 `BEGIN IMMEDIATE` 事务中，并由进程内写锁串行化；
   并发摄取下每个区块恰好应用一次，重复投递幂等返回。
 
+## 规范链切换审计
+
+每次**真正的**规范链切换（某条分叉取代当前链尖）都会在状态切换的**同一事务**
+内写一条 `reorg_audits` 记录，字段含义：
+
+| 字段 | 含义 |
+| --- | --- |
+| `id` / `created_at_ns` | 自增主键与纳秒产生时间；列表按 `created_at_ns DESC, id DESC` 倒序 |
+| `trigger_block_hash` | 触发本次切换的区块 |
+| `fork_height` / `depth` | 分叉点（共同祖先）高度与切换深度（旧链被替换的区块数） |
+| `old_tip` / `new_tip` | 切换前/后的链尖哈希与高度 |
+| `replaced_blocks` | 本次被换下去的块（原 CANONICAL → REORGED，高度升序） |
+| `readopted_blocks` | 原本在分叉上、本次随胜出链**重新回到规范链**的块（含曾被换为 REORGED 的块，以及搭在回归链上的暂存延伸块；本次新投递的触发块不计入） |
+
+一致性保证：
+
+- **与状态切换同生共死**：审计与区块状态翻转、进度推进在一个事务里；切换
+  因重组过深或任一步失败而回滚时，审计也一并回滚，不会留下「无对应切换」的记录。
+- **重复投递不凭空记账**：初始建链、规范链正常延伸、同一区块/同一数据集
+  重复投递都不构成切换，不产生新记录（幂等返回 `applied=false`）。
+- 记录**只追加**，通过 `GET /reorgs/audits?limit=&offset=` 按时间倒序翻查。
+
+```bash
+curl -s http://127.0.0.1:8000/reorgs/audits?limit=20 | jq
+```
+
+## 只读自检
+
+`GET /health` 对当前索引做分项一致性检查，返回：
+
+```json
+{
+  "ok": false,
+  "checks": [
+    {"name": "canonical_continuity", "ok": false, "issues": [
+      {"check": "canonical_continuity",
+       "message": "规范链断链: a3 的 parent 是 a2，期望 a1",
+       "block_hashes": ["a3"], "tx_hashes": []}]}
+  ]
+}
+```
+
+四个分项：
+
+| 检查项 | 检查内容 |
+| --- | --- |
+| `canonical_continuity` | 规范链是否从创世起逐块 parent/height 连续、同高度是否有多个规范块 |
+| `block_parent_consistency` | 每个块的状态是否与父链对得上（规范块父块必须规范、缺父块只能是 staged、高度须相邻） |
+| `canonical_txs` | 规范链交易是否归属正确、有无重复、有无悬空（归属块不存在） |
+| `progress` | 记录进度是否与当前规范链尖高度一致 |
+
+有问题时不是只回一个对/错，而是在 `issues` 里点名**具体的 `block_hashes` /
+`tx_hashes`** 及可读说明。检查全程**只读**：
+
+- 不执行任何写入，重复调用不改变数据（有 `test_health_is_read_only` 守护）。
+- 快照在与写入事务**互斥的存储锁**内一次性取齐区块、交易、进度三张表，因此
+  并发摄取过程中调用自检，只会看到写前或写后的完整状态，读不到改了一半的
+  中间状态（有 `test_health_never_reads_half_written_state` 守护）。
+- HTTP 始终返回 200，由响应体 `ok` 区分自洽与否（自检动作本身成功执行）。
+
+## 整批原子摄取
+
+`POST /ingest/blocks/atomic` 与原 `POST /ingest/blocks` 的语义区别：
+
+| 维度 | `/ingest/blocks`（保留，逐块） | `/ingest/blocks/atomic`（新增，整批） |
+| --- | --- | --- |
+| 事务边界 | 每个区块各自一个事务 | 整批共用**一个事务** |
+| 一块被拒 | 其它块照常落库，逐项返回 error | **整批回滚，不留任何数据**（含已暂存的前半批） |
+| 返回 | 200 + 逐项成功/错误混合 | 成功返回 `{applied, duplicates, results}`；任一被拒则整批返回对应 4xx/5xx |
+| 批内重复 | 幂等 | 同样幂等，计入 `duplicates`、`applied=false`，**不算失败** |
+| 等锁 | 无显式上限 | 等待写锁超过 `lock_timeout` 抛 `lock_timeout`（503，可重试） |
+
+适用场景：希望「一个投递单元整体生效」、不能接受部分应用的批量同步任务。
+原逐块接口与逐块服务方法 `ingest_block` 行为不变，可继续用于容忍部分失败、
+需要逐项结果的场景。
+
+底层数据库异常统一包装为 `storage_error`（500），不会把 SQLite 原生异常直接
+返回给调用方；等锁超时单独归类为 `lock_timeout`（503，可重试），二者可区分。
+
 ## 错误分类
 
 | category | HTTP | 含义 | 处理方式 |
@@ -80,6 +176,8 @@ tests/               基于固定数据的重组/重复/乱序/并发/畸形/回
 | `source_unavailable` | 503 | 本地数据源暂时不可读 | 可重试 |
 | `state_conflict` | 409 | 与已持久化状态矛盾（内容冲突、进度回退） | 检查调用方状态 |
 | `reorg_too_deep` | 422 | 重组深度超过 `max_reorg_depth` | 需人工介入确认 |
+| `lock_timeout` | 503 | 整批提交等待写锁超过 `lock_timeout` | 可重试的临时故障 |
+| `storage_error` | 500 | 底层存储故障（已包装，不外泄原生异常） | 排查存储后重试 |
 
 错误响应体：`{"error": {"category", "message", "detail"}}`。
 
@@ -91,9 +189,20 @@ tests/               基于固定数据的重组/重复/乱序/并发/畸形/回
 | `INDEXER_GENESIS_HASH` | `""`（不校验） | 创世块哈希，非空时校验高度 0 区块 |
 | `INDEXER_DB_PATH` | `:memory:` | SQLite 路径，设为文件路径即持久化 |
 | `INDEXER_SOURCE_PATH` | 未设置 | 本地数据源 JSON 文件路径 |
+| `INDEXER_LOCK_TIMEOUT` | `5` | 整批提交等待写锁的上限（秒），超时返回 `lock_timeout` |
 
-数据源文件格式：`{"blocks": [{block_hash, parent_hash, height, timestamp,
-transactions: [...]}, ...]}`。
+## 兼容性
+
+- **已有数据**：新增的 `reorg_audits` 表通过 `CREATE TABLE IF NOT EXISTS`
+  幂等建表，打开旧库会自动补齐，不影响已有的 `blocks`/`txs`/`progress`
+  数据与查询结果。升级前产生的历史切换没有审计记录（表从升级后开始记录），
+  不影响索引一致性。
+- **原有接口**：`/ingest/block`、`/ingest/blocks`、`/ingest/from-source`、
+  `/blocks`、`/chain/canonical`、`/progress` 的路径、请求/响应结构与语义
+  全部保持不变；新增能力走**独立的新路径**（`/ingest/blocks/atomic`、
+  `/reorgs/audits`、`/health`），不改动老调用方。
+- 区块三状态（canonical/reorged/staged）的定义与原文档一致；新表、新错误
+  分类（`lock_timeout`、`storage_error`）均为纯增量。
 
 ## 运行与验证
 
@@ -103,6 +212,30 @@ uv run uvicorn main:app --reload          # 启动服务
 uv run pytest tests/ -v                   # 运行测试（日志打印输入与判定依据）
 ```
 
-测试覆盖：乱序/重复投递、重组切换与状态区分、过深重组拒绝、畸形负载、
-进度回退、并发摄取不重不漏、数据源不可用与畸形分类。测试日志通过
-`log_cli` 输出每个用例的输入与判定依据。
+本地手工验证新能力：
+
+```bash
+# 1) 整批原子摄取主链
+curl -s -X POST localhost:8000/ingest/blocks/atomic -H 'content-type: application/json' \
+  -d '{"blocks":[ ... ]}'
+# 2) 触发一次重组后，按时间倒序查看切换审计
+curl -s localhost:8000/reorgs/audits | jq
+# 3) 随时做只读自检（分项 ok 与问题清单）
+curl -s localhost:8000/health | jq
+```
+
+测试覆盖：在既有的乱序/重复投递、重组切换与状态区分、过深重组拒绝、畸形
+负载、进度回退、并发摄取不重不漏、数据源不可用与畸形分类之外，新增：
+
+- `tests/test_audit.py`：切换审计字段如实、初始建链/正常延伸不记账、切换
+  失败（过深拒绝 / 审计写入注入失败）整体回滚不留记录、重复投递不重复记账、
+  被换下去的块随分叉反超回归时 `readopted_blocks` 如实反映、审计倒序分页。
+- `tests/test_health.py`：健康索引四项全过；人为破坏规范链连续性、进度、
+  交易归属时给出点名具体块/交易的问题清单；自检只读；并发摄取期间读不到
+  改了一半的中间状态。
+- `tests/test_batch.py`：整批原子摄取在畸形块/重组过深时整体不留数据、
+  整批合法一次生效、批内重复幂等计入 duplicates、等锁超时返回可区分可重试
+  的 `lock_timeout` 且不卡死。
+- `tests/test_source_api.py`：新增三个 HTTP 端点的端到端行为。
+
+测试日志通过 `log_cli` 输出每个用例的输入与判定依据。

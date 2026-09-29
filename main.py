@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from indexer.config import IndexerConfig
 from indexer.errors import IngestError
+from indexer.health import HealthChecker
 from indexer.models import Block, BlockStatus, Transaction
 from indexer.service import IngestService
 from indexer.source import LocalChainSource
@@ -21,6 +22,8 @@ _CATEGORY_STATUS = {
     "source_unavailable": 503,
     "state_conflict": 409,
     "reorg_too_deep": 422,
+    "lock_timeout": 503,       # 等锁超时：可重试的临时故障
+    "storage_error": 500,
     "internal": 500,
 }
 
@@ -80,9 +83,11 @@ def create_app(config: IndexerConfig | None = None,
         max_reorg_depth=int(os.environ.get("INDEXER_MAX_REORG_DEPTH", "6")),
         genesis_hash=os.environ.get("INDEXER_GENESIS_HASH", ""),
         db_path=os.environ.get("INDEXER_DB_PATH", ":memory:"),
+        lock_timeout=float(os.environ.get("INDEXER_LOCK_TIMEOUT", "5")),
     )
-    store = Store(config.db_path)
+    store = Store(config.db_path, lock_timeout=config.lock_timeout)
     service = IngestService(store, config)
+    health = HealthChecker(store)
     if source is None and os.environ.get("INDEXER_SOURCE_PATH"):
         source = LocalChainSource(os.environ["INDEXER_SOURCE_PATH"])
 
@@ -90,6 +95,7 @@ def create_app(config: IndexerConfig | None = None,
     app.state.service = service
     app.state.store = store
     app.state.source = source
+    app.state.health = health
     app.state.config = config
 
     @app.exception_handler(IngestError)
@@ -127,6 +133,24 @@ def create_app(config: IndexerConfig | None = None,
                                "error": {"category": exc.category,
                                          "message": exc.message}})
         return {"results": outcomes}
+
+    @app.post("/ingest/blocks/atomic")
+    def ingest_blocks_atomic(payload: BatchIn):
+        """整批原子摄取：一批要么全部生效，要么整体回滚不留任何数据。
+
+        与 /ingest/blocks 的逐块独立事务不同；批次内重复投递按幂等处理、
+        计入 duplicates 不算失败；任一区块被拒整批拒绝（错误分类直接返回，
+        整批 4xx/5xx），不会逐块混入 outcomes。
+        """
+        blocks = [item.to_block() for item in payload.blocks]
+        result = service.ingest_blocks_atomic(blocks)
+        return {
+            "applied": result.applied,
+            "duplicates": result.duplicates,
+            "results": [{"block_hash": r.block_hash, "status": r.status.value,
+                         "applied": r.applied, "reorg_depth": r.reorg_depth}
+                        for r in result.results],
+        }
 
     @app.post("/ingest/from-source")
     def ingest_from_source():
@@ -169,6 +193,43 @@ def create_app(config: IndexerConfig | None = None,
     @app.get("/progress")
     def progress():
         return {"height": store.get_progress()}
+
+    # ---- 重组审计 ----
+    @app.get("/reorgs/audits")
+    def reorg_audits(limit: int = 50, offset: int = 0):
+        """按时间倒序翻查规范链切换审计记录。"""
+        records = store.list_reorg_audits(limit=max(1, min(limit, 500)),
+                                          offset=max(0, offset))
+        return {"audits": [
+            {"id": r.id, "created_at_ns": r.created_at_ns,
+             "trigger_block_hash": r.trigger_block_hash,
+             "fork_height": r.fork_height, "depth": r.depth,
+             "old_tip": {"block_hash": r.old_tip_hash,
+                         "height": r.old_tip_height},
+             "new_tip": {"block_hash": r.new_tip_hash,
+                         "height": r.new_tip_height},
+             "replaced_blocks": list(r.replaced_blocks),
+             "readopted_blocks": list(r.readopted_blocks)}
+            for r in records]}
+
+    # ---- 只读自检 ----
+    @app.get("/health")
+    def health_check():
+        """只读自检：分项给出结论，问题清单定位到具体块/交易；不落任何数据。
+
+        HTTP 200 表示全部检查通过；发现问题返回 200 但 ok=false（自检本身
+        成功执行、索引存在破损），由调用方据 ok 字段判断。
+        """
+        report = health.run_checks()
+        return {
+            "ok": report.ok,
+            "checks": [{"name": c.name, "ok": c.ok,
+                        "issues": [{"check": i.check, "message": i.message,
+                                    "block_hashes": list(i.block_hashes),
+                                    "tx_hashes": list(i.tx_hashes)}
+                                   for i in c.issues]}
+                       for c in report.checks],
+        }
 
     return app
 

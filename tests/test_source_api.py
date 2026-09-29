@@ -136,3 +136,50 @@ def test_api_batch_ingest_mixed_outcomes(client):
     assert results[0]["status"] == "staged"          # 父缺失暂存
     assert results[1]["status"] == "canonical"
     assert results[2]["error"]["category"] == "malformed_payload"
+
+
+def _new_client():
+    return TestClient(create_app(IndexerConfig(max_reorg_depth=3,
+                                               genesis_hash="g0")))
+
+
+def test_api_atomic_batch_audit_and_health():
+    """新端点：整批原子摄取、审计倒序、只读自检协同工作。"""
+    c = _new_client()
+    # 整批原子摄取主链
+    r = c.post("/ingest/blocks/atomic",
+               json={"blocks": [_payload(b) for b in main_chain()]})
+    assert r.status_code == 200
+    body = r.json()
+    log.info("输入: 原子批次摄取主链 -> applied=%s duplicates=%s",
+             body["applied"], body["duplicates"])
+    assert body["applied"] == 4 and body["duplicates"] == 0
+
+    # 触发一次重组（b 链更长）
+    for b in fork_b():
+        assert c.post("/ingest/block", json=_payload(b)).status_code == 200
+    audits = c.get("/reorgs/audits").json()["audits"]
+    log.info("判定依据: 审计条数=%d，最近一次 replaced=%s",
+             len(audits), audits[0]["replaced_blocks"])
+    assert len(audits) == 1
+    assert audits[0]["replaced_blocks"] == ["a1", "a2", "a3"]
+    assert audits[0]["old_tip"]["block_hash"] == "a3"
+    assert audits[0]["new_tip"]["block_hash"] == "b4"
+
+    # 自检：当前索引自洽
+    health = c.get("/health").json()
+    log.info("判定依据: 自检 ok=%s，分项=%s", health["ok"],
+             {x["name"]: x["ok"] for x in health["checks"]})
+    assert health["ok"]
+
+    # 原子批次内含畸形块 -> 整批 400，不留数据
+    bad = {"block_hash": "zzz", "parent_hash": "g0", "height": 1,
+           "timestamp": 0, "transactions": [
+               {"tx_hash": "t", "sender": "a", "recipient": "b",
+                "amount": -1, "nonce": 0}]}
+    r = c.post("/ingest/blocks/atomic", json={"blocks": [bad]})
+    log.info("输入: 原子批次含畸形块 -> HTTP %d %s",
+             r.status_code, r.json()["error"]["category"])
+    assert r.status_code == 400
+    assert r.json()["error"]["category"] == "malformed_payload"
+    assert c.get("/blocks/zzz").status_code == 404

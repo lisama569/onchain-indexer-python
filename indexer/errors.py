@@ -36,3 +36,15 @@ class ReorgTooDeepError(IngestError):
     """重组深度超过允许上限，必须显式拒绝。"""
 
     category = "reorg_too_deep"
+
+
+class LockTimeoutError(IngestError):
+    """等待写锁超过时限：可重试的临时故障，不携带底层数据库异常。"""
+
+    category = "lock_timeout"
+
+
+class StorageError(IngestError):
+    """底层存储故障的统一包装，避免把数据库原生异常直接甩给调用方。"""
+
+    category = "storage_error"
