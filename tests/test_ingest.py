@@ -59,7 +59,10 @@ def test_reorg_switches_canonical_and_marks_replaced(service):
     fork = fork_b()
     for b in fork[:3]:
         r = service.ingest_block(b)
-        assert r.status == BlockStatus.STAGED  # 未超过主链高度，保持暂存
+        # b1..b3 连通到创世但未超过主链：新三态口径下属于「已连通但输掉
+        # 竞争」的分叉块，确定归类为 REORGED（结论只取决于最终区块集合，
+        # 与投递顺序无关），而不是随投递时机摇摆的 STAGED
+        assert r.status == BlockStatus.REORGED
     log.info("输入: 主链 g0..a3（高3），分叉 b1..b4（高4），max_reorg_depth=3")
 
     r = service.ingest_block(fork[3])  # b4 触发重组，深度 = 3-0 = 3

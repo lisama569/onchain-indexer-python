@@ -122,30 +122,43 @@ def test_duplicate_delivery_does_not_add_audit(service):
 
 
 def test_readopted_blocks_recorded_when_fork_returns(service):
-    """被换下去的块之后随分叉反超重新回到规范链，readopted 如实反映。"""
+    """被换下去的块之后随分叉反超重新回到规范链，readopted 如实反映。
+
+    构造：a 链先规范，b 链反超把 a1..a3 换下去；此时把触发块 a5 作为
+    「父块缺失」的孤立块先暂存，再投 a4（连通即落败 REORGED，随后因其
+    让 a5 连通且高度反超而立即触发 a 链回归）。这样 readopted 同时覆盖：
+    曾被换下去的旧块 a1..a3、连通即落败又随链回归的 a4。
+    """
     # 放宽上限以便演示 a 链回归需要的深度
     service._config = type(service._config)(
         max_reorg_depth=10, genesis_hash="g0")
 
     for b in main_chain():  # a 链先规范
         service.ingest_block(b)
-    for b in fork_b():     # b 链更深，a1..a3 被换下去
+    for b in fork_b():     # b 链更高，a1..a3 被换下去
         service.ingest_block(b)
-    service.ingest_block(make_block("a4", "a3", 4))  # 搭在 REORGED 链上的延伸
-    log.info("输入: b 链胜出后，a 链延伸 a4,a5 反超（深度4）")
-
+    # 触发块 a5 先到：父 a4 尚不在库 -> STAGED
     service.ingest_block(make_block("a5", "a4", 5))
+    assert service._store.get_block("a5")[1] == BlockStatus.STAGED
+    log.info("输入: b 链胜出后，a5 因父缺失暂存；再投 a4 连通并使 a5 反超")
+
+    # a4 先以 REORGED 落库（连通但高度不超 b4），随后重算发现 a5 已连通、
+    # 高 5 > 4，由链尖 a5 触发 a 链回归（深度4）
+    service.ingest_block(make_block("a4", "a3", 4))
 
     audits = _audits(service)
     # 两次切换：a->b，b->a
     latest = audits[0]  # 倒序：最新在前
-    log.info("判定依据: 最近一次审计 replaced=%s readopted=%s",
-             latest.replaced_blocks, latest.readopted_blocks)
+    log.info("判定依据: 最近一次审计 trigger=%s replaced=%s readopted=%s",
+             latest.trigger_block_hash, latest.replaced_blocks,
+             latest.readopted_blocks)
+    assert latest.trigger_block_hash == "a5"
     assert latest.old_tip_hash == "b4" and latest.new_tip_hash == "a5"
     assert set(latest.replaced_blocks) == {"b1", "b2", "b3", "b4"}
-    # a1..a3 曾被换下去，a4 搭在回归链上暂存：本次都重新回到规范链
+    # a1..a3 是曾被换下去的回归旧块；a4 先连通即落败、随即随链回归：
+    # 本次都重新回到规范链
     assert set(latest.readopted_blocks) == {"a1", "a2", "a3", "a4"}
-    assert "a5" not in latest.readopted_blocks  # 触发块本身是新投递
+    assert "a5" not in latest.readopted_blocks  # 触发块本身不计入
     assert [b.block_hash for b in service.canonical_chain()] == \
         ["g0", "a1", "a2", "a3", "a4", "a5"]
 
@@ -158,8 +171,11 @@ def test_audits_returned_newest_first(service):
         service.ingest_block(b)
     for b in fork_b():  # 切换 1：a->b
         service.ingest_block(b)
+    # a5 先作为父缺失块暂存，再投 a4：a4 连通使 a5 反超，切换 2 的链尖为 a5
+    # （若直接先投 a4，同高平局按链尖哈希 a4<b4 会在 a4 处先切换，
+    #  这本身也是确定结论；这里采用暂存顺序以演示链尖 a5 的记录形态）
+    service.ingest_block(make_block("a5", "a4", 5))
     service.ingest_block(make_block("a4", "a3", 4))
-    service.ingest_block(make_block("a5", "a4", 5))  # 切换 2：b->a
 
     audits = _audits(service)
     assert [a.new_tip_hash for a in audits] == ["a5", "b4"]

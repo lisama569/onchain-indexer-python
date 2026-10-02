@@ -54,6 +54,14 @@ CREATE INDEX IF NOT EXISTS idx_audits_created
     ON reorg_audits(created_at_ns DESC, id DESC);
 """
 
+# 历史标记列：该块是否曾经成为过规范链的一部分。
+# 这是「曾被换下去(REORGED 且 ever_canonical=1)」与
+# 「从未进入规范链(REORGED 且 ever_canonical=0)」的唯一权威区分，
+# 不随当前三态翻转而丢失。旧库升级时幂等补列（默认 0）。
+_MIGRATIONS = (
+    "ALTER TABLE blocks ADD COLUMN ever_canonical INTEGER NOT NULL DEFAULT 0",
+)
+
 
 def _row_to_block(row: sqlite3.Row, txs: tuple[Transaction, ...]) -> Block:
     return Block(
@@ -109,6 +117,12 @@ class Store:
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            cols = {r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(blocks)").fetchall()}
+            for ddl in _MIGRATIONS:
+                col = ddl.split("ADD COLUMN")[1].split()[0]
+                if col not in cols:
+                    self._conn.execute(ddl)
 
     # ---- 区块与交易 ----
     def get_block(self, block_hash: str) -> tuple[Block, BlockStatus] | None:
@@ -158,6 +172,30 @@ class Store:
                 "UPDATE blocks SET status = ? WHERE block_hash = ?",
                 (status.value, block_hash),
             )
+
+    def ever_canonical(self, block_hash: str) -> bool:
+        """该块是否曾经成为过规范链的一部分（历史标记，不可逆）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT ever_canonical FROM blocks WHERE block_hash = ?",
+                (block_hash,),
+            ).fetchone()
+            return bool(row["ever_canonical"]) if row is not None else False
+
+    def mark_ever_canonical(self, block_hashes) -> None:
+        """把本次处于规范链上的块永久标记为「曾进入规范链」（幂等）。"""
+        with self._lock:
+            self._conn.executemany(
+                "UPDATE blocks SET ever_canonical = 1 WHERE block_hash = ?",
+                [(h,) for h in block_hashes],
+            )
+
+    def list_ever_canonical(self) -> set[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT block_hash FROM blocks WHERE ever_canonical = 1"
+            ).fetchall()
+            return {r["block_hash"] for r in rows}
 
     def children_of(self, parent_hash: str) -> list[str]:
         with self._lock:
@@ -334,7 +372,8 @@ class Store:
             BlockSnapshot(block_hash=r["block_hash"],
                           parent_hash=r["parent_hash"],
                           height=r["height"],
-                          status=BlockStatus(r["status"]))
+                          status=BlockStatus(r["status"]),
+                          ever_canonical=bool(r["ever_canonical"]))
             for r in block_rows
         )
         tx_rows = self._conn.execute(
@@ -342,8 +381,12 @@ class Store:
         txs = tuple(_row_to_tx(r) for r in tx_rows)
         prow = self._conn.execute(
             "SELECT height FROM progress WHERE id = 1").fetchone()
+        audit_rows = self._conn.execute(
+            "SELECT * FROM reorg_audits ORDER BY id ASC").fetchall()
+        audits = tuple(_row_to_audit(r) for r in audit_rows)
         return StoreSnapshot(blocks=blocks, txs=txs,
-                             progress=prow["height"] if prow else -1)
+                             progress=prow["height"] if prow else -1,
+                             audits=audits)
 
     def close(self) -> None:
         self._conn.close()

@@ -87,7 +87,7 @@ def create_app(config: IndexerConfig | None = None,
     )
     store = Store(config.db_path, lock_timeout=config.lock_timeout)
     service = IngestService(store, config)
-    health = HealthChecker(store)
+    health = HealthChecker(store, genesis_hash=config.genesis_hash)
     if source is None and os.environ.get("INDEXER_SOURCE_PATH"):
         source = LocalChainSource(os.environ["INDEXER_SOURCE_PATH"])
 

@@ -1,13 +1,18 @@
 """只读自检：对当前索引做分项一致性检查，输出可定位的问题清单。
 
 检查全程只读，且在与写入互斥的一致性快照上进行（Store.snapshot 在写锁
-保护下一次性取齐三表），不会读到改了一半的中间状态，也不会改动任何数据。
+保护下一次性取齐区块/交易/进度/审计四表），不会读到改了一半的中间状态，
+也不会改动任何数据。
 
 分项：
 - canonical_continuity：规范链从创世到链尖 parent/height 是否连续、链尖是否唯一；
 - block_parent_consistency：每个块的状态与其父链位置是否对得上；
 - canonical_txs：规范链上的交易是否归属正确、有无重复或悬空；
-- progress：记录的进度是否与当前规范链尖一致。
+- progress：记录的进度是否与当前规范链尖一致；
+- status_classification：三态归类是否与顺序无关的拓扑口径完全一致，
+  以及 ever_canonical 历史标记是否自洽（实现/查询/自检同一套结论）；
+- audit_reconciliation：审计的 replaced/readopted 清单逐条回放后，
+  推出的最终三态是否与实际状态一致，有无互相矛盾的块。
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ from dataclasses import dataclass, field
 
 from .models import BlockStatus, StoreSnapshot
 from .store import Store
+from .topology import classify_blocks
 
 
 @dataclass(frozen=True)
@@ -49,8 +55,9 @@ class HealthReport:
 class HealthChecker:
     """只读自检入口。"""
 
-    def __init__(self, store: Store) -> None:
+    def __init__(self, store: Store, genesis_hash: str = "") -> None:
         self._store = store
+        self._genesis_hash = genesis_hash
 
     def run_checks(self) -> HealthReport:
         # 取快照这一步与写入事务互斥；之后所有计算都在不可变快照上，纯只读。
@@ -60,6 +67,8 @@ class HealthChecker:
             self._check_block_parent_consistency(snap),
             self._check_canonical_txs(snap),
             self._check_progress(snap),
+            self._check_status_classification(snap),
+            self._check_audit_reconciliation(snap),
         )
         issues = tuple(i for c in checks for i in c.issues)
         return HealthReport(ok=all(c.ok for c in checks),
@@ -227,3 +236,135 @@ class HealthChecker:
                     f"记录进度 {snap.progress} 与规范链尖高度 {tip_height} 不一致",
                     block_hashes=tuple(tip_hashes)),))
         return CheckResult("progress", ok=True, issues=())
+
+    # ---- 5. 三态归类与顺序无关拓扑口径一致 ----
+    def _check_status_classification(
+            self, snap: StoreSnapshot) -> CheckResult:
+        """存储中的三态必须等于 topology.classify_blocks 对同一区块集合
+        给出的确定结论；ever_canonical 历史标记也必须自洽。
+
+        这一项保证「实现/查询/自检同一套口径」：任何块最终落到哪一类，
+        都能由最终区块集合直接解释，与投递顺序、并发度无关。
+        """
+        issues: list[CheckIssue] = []
+        view = classify_blocks(list(snap.blocks),
+                               genesis_hash=self._genesis_hash)
+        expected = view.statuses
+        for b in snap.blocks:
+            want = expected.get(b.block_hash)
+            if want is not None and b.status != want:
+                issues.append(CheckIssue(
+                    "status_classification",
+                    f"块 {b.block_hash}(h={b.height}) 存储状态为 "
+                    f"{b.status.value}，按统一拓扑口径应为 {want.value}"
+                    "（结论只取决于最终区块集合，不应随投递顺序变化）",
+                    block_hashes=(b.block_hash,)))
+
+        # ever_canonical 标记自洽：
+        #  - 当前 CANONICAL 的块标记必为 1（在链上即曾进入）；
+        #  - 标记为 1 的块不可能是 STAGED（连通才可能进过规范链）。
+        for b in snap.blocks:
+            if b.status == BlockStatus.CANONICAL and not b.ever_canonical:
+                issues.append(CheckIssue(
+                    "status_classification",
+                    f"规范块 {b.block_hash} 缺少 ever_canonical 历史标记",
+                    block_hashes=(b.block_hash,)))
+            if b.status == BlockStatus.STAGED and b.ever_canonical:
+                issues.append(CheckIssue(
+                    "status_classification",
+                    f"暂存块 {b.block_hash} 带有 ever_canonical 标记"
+                    "（未连通创世块的块不可能进入过规范链）",
+                    block_hashes=(b.block_hash,)))
+
+        return CheckResult("status_classification", ok=not issues,
+                           issues=tuple(issues))
+
+    # ---- 6. 审计清单与最终三态对账 ----
+    def _check_audit_reconciliation(
+            self, snap: StoreSnapshot) -> CheckResult:
+        """按时间正序回放每条审计的 replaced/readopted 清单，推出每个块
+        「最后一次被提到时的归属方向」，它必须与最终状态一致：
+
+        - 最后一次出现在 replaced（且其后没有 readopt）-> 最终须 REORGED；
+        - 最后一次出现在 readopted（且其后没有被 replace）-> 最终须
+          CANONICAL。
+
+        另外校验三态与历史标记的细分区分：
+        - REORGED + ever_canonical=1 = 曾被换下去；
+        - REORGED + ever_canonical=0 = 连通即落败、从未进入规范链。
+        """
+        issues: list[CheckIssue] = []
+        by_hash = {b.block_hash: b for b in snap.blocks}
+
+        # 同一清单内部不得自相矛盾：一个块不能在同一次切换中既被换下又被接纳
+        for rec in snap.audits:
+            overlap = set(rec.replaced_blocks) & set(rec.readopted_blocks)
+            if overlap:
+                issues.append(CheckIssue(
+                    "audit_reconciliation",
+                    f"审计 {rec.id} 中块 {sorted(overlap)} 同时出现在 "
+                    "replaced 与 readopted 清单（同一次切换说法矛盾）",
+                    block_hashes=tuple(sorted(overlap))))
+
+        # 正序回放，记录每个块最后一次清单事件的方向
+        last_direction: dict[str, str] = {}
+        for rec in snap.audits:
+            for h in rec.replaced_blocks:
+                last_direction[h] = "replaced"
+            for h in rec.readopted_blocks:
+                last_direction[h] = "readopted"
+
+        for h, direction in last_direction.items():
+            blk = by_hash.get(h)
+            if blk is None:
+                issues.append(CheckIssue(
+                    "audit_reconciliation",
+                    f"审计清单提到的块 {h} 已不在索引中（审计与数据互相矛盾）",
+                    block_hashes=(h,)))
+                continue
+            if direction == "replaced" \
+                    and blk.status != BlockStatus.REORGED:
+                issues.append(CheckIssue(
+                    "audit_reconciliation",
+                    f"块 {h} 最后一次审计事件是「被换下去」，"
+                    f"但最终状态为 {blk.status.value}（审计与最终状态矛盾）",
+                    block_hashes=(h,)))
+            if direction == "readopted" \
+                    and blk.status != BlockStatus.CANONICAL:
+                issues.append(CheckIssue(
+                    "audit_reconciliation",
+                    f"块 {h} 最后一次审计事件是「重新接纳」，"
+                    f"但最终状态为 {blk.status.value}（审计与最终状态矛盾）",
+                    block_hashes=(h,)))
+            # 能出现在任一清单里，说明确实进入过规范链
+            if not blk.ever_canonical:
+                issues.append(CheckIssue(
+                    "audit_reconciliation",
+                    f"块 {h} 出现在切换清单中却缺少 ever_canonical 标记",
+                    block_hashes=(h,)))
+
+        # 反向对账：曾被换下去（REORGED 且 ever_canonical=1）的块，
+        # 在审计流中必须能找到一次 replaced 且其后未被重新接纳的记录；
+        # 从未进入规范链（REORGED 且 ever_canonical=0）的块绝不能出现在
+        # 任何 replaced/readopted 清单中。
+        mentioned = set(last_direction)
+        for b in snap.blocks:
+            if b.status != BlockStatus.REORGED:
+                continue
+            if b.ever_canonical and last_direction.get(b.block_hash) \
+                    != "replaced":
+                issues.append(CheckIssue(
+                    "audit_reconciliation",
+                    f"块 {b.block_hash} 归类为「曾被换下去」"
+                    "（REORGED 且曾进入规范链），但审计流的最后事件不是 "
+                    "replaced（归类无法由审计复查）",
+                    block_hashes=(b.block_hash,)))
+            if not b.ever_canonical and b.block_hash in mentioned:
+                issues.append(CheckIssue(
+                    "audit_reconciliation",
+                    f"块 {b.block_hash} 归类为「从未进入规范链」，"
+                    "却出现在审计的切换清单中（归类与审计矛盾）",
+                    block_hashes=(b.block_hash,)))
+
+        return CheckResult("audit_reconciliation", ok=not issues,
+                           issues=tuple(issues))

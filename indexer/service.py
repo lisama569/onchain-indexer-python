@@ -2,13 +2,18 @@
 
 规则概述：
 - 幂等：同一区块重复投递不产生重复记录，返回 applied=False。
-- 暂存：父块缺失的区块以 STAGED 保留；已连通但暂未胜出的分叉块同样为 STAGED。
-- 规范链：始终选择已连通链中高度最高者；触发切换时同步更新被替换
-  区块及其交易的归属（区块状态 CANONICAL -> REORGED，交易随区块派生）。
-- 审计：每次真正的规范链切换在状态切换的同一事务内写一条 reorg_audits，
-  记录切换前后链尖、切换深度、被换下去的块(replaced)与原本在分叉上、
-  本次重新回到规范链的块(readopted)；切换失败随事务整体回滚不留记录，
-  重复投递不触发切换、不凭空记账。
+- 三态判定顺序无关：每次写入后基于「全部已落库区块集合」做一次确定性的
+  拓扑分类（indexer.topology.classify_blocks，service/health/查询同一口径），
+  因此同一份数据无论以什么顺序、什么并发度投递，最终三类归类完全一致：
+  - CANONICAL：从创世块连通的链中链尖最高（同高取链尖哈希最小）的唯一链；
+  - REORGED：已连通到创世块、但不在规范链上的分叉块（含历史上曾被换下去
+    的块，以及连通时即输掉竞争、从未进入过规范链的块——二者的区分可从
+    重组审计的 replaced/readopted 清单复查）；
+  - STAGED：祖先链无法连通到创世块的块（缺父块、或与父块高度不连续）。
+- 审计：只有「本次重算导致规范链集合发生变化」时才在同一事务内写一条
+  reorg_audits，记录切换前后链尖、深度、被换下去的块(replaced：
+  CANONICAL→非规范)与重新接纳的块(readopted：非规范→CANONICAL，触发块
+  本身不计入)；初始建链、规范链正常延伸、落败分叉连通、重复投递都不记账。
 - 重组深度超过 max_reorg_depth 时整体拒绝（事务回滚，不产生部分写入）。
 - 进度只随规范链尖端单调前进。
 """
@@ -24,6 +29,7 @@ from .errors import (MalformedPayloadError, ReorgTooDeepError,
 from .models import (BatchIngestResult, Block, BlockStatus, IngestResult,
                      ReorgAuditRecord)
 from .store import Store
+from .topology import classify_blocks
 
 
 class IngestService:
@@ -63,133 +69,111 @@ class IngestService:
                 detail={"block_hash": block.block_hash, "problems": problems},
             )
 
-    # ---- 规范链 ----
-    def _canonical_tip(self) -> Block | None:
-        canonical = self._store.list_blocks(BlockStatus.CANONICAL)
-        if not canonical:
-            return None
-        return max((b for b, _ in canonical), key=lambda b: b.height)
+    # ---- 规范链（顺序无关的整体重算） ----
+    def _reclassify(self, trigger_hash: str | None) -> int:
+        """基于全量已落库区块做确定性三态重算并落地状态翻转与审计。
 
-    def _connect(self, block_hash: str) -> int:
-        """已连通区块的规范链判定；返回本次触发的重组深度（0 表示无切换）。"""
-        entry = self._store.get_block(block_hash)
-        assert entry is not None
-        blk, _ = entry
-        tip = self._canonical_tip()
-        if tip is not None and blk.height <= tip.height:
-            return 0  # 已连通但未胜出，保持 STAGED（未来可能重新参与竞争）
+        返回本次规范链切换的重组深度（0 表示无切换）。
+        调用方必须已持有 store 的写事务。
+        """
+        all_entries = self._store.list_blocks()
+        all_blocks = [b for b, _ in all_entries]
+        old_canonical = {b.block_hash for b, st in all_entries
+                         if st == BlockStatus.CANONICAL}
 
-        # 回溯到最近的规范祖先，确定分叉点；沿途经过的非规范块
-        # （STAGED 的延伸块或 REORGED 的回归块）都属于本次要提升的新链；
-        # 若链未连通到创世块则保持暂存。
-        chain: list[Block] = []
-        cur = blk
-        fork_height = -1
-        while True:
-            chain.append(cur)
-            parent = self._store.get_block(cur.parent_hash)
-            if parent is None:
-                if cur.height == 0:
-                    break  # 创世块自身为根
-                return 0  # 祖先链未连通到规范链，保持 STAGED，不提升
-            if parent[1] == BlockStatus.CANONICAL:
-                fork_height = parent[0].height
-                break
-            cur = parent[0]
+        view = classify_blocks(all_blocks,
+                               genesis_hash=self._config.genesis_hash)
+        new_canonical = set(view.canonical_hashes)
+        replaced_set = old_canonical - new_canonical
+        adopted_set = new_canonical - old_canonical
 
-        depth = (tip.height - fork_height) if tip is not None else 0
-        if tip is not None and depth == 0:
-            # 新块只是当前规范链的正常延伸（分叉点即链尖），无切换、无翻转、
-            # 不记账。递归连接子块时也可能走到这里，必须短路，避免把规范链
-            # 当成旧链「重放」一遍并误写审计。
-            for b in chain:
-                self._store.set_block_status(b.block_hash, BlockStatus.CANONICAL)
-            self._store.advance_progress(blk.height)
+        # 规范链集合变化但没有旧规范块被换下：初始建链或正常延伸，
+        # 不构成「切换」，只落地状态/进度，不翻转、不记账。
+        # 只标记「本次新进入规范链」的块（adopted），不能把整个规范集合
+        # 都打上标记——否则乱序下最终落败、仅在投递瞬间临时胜出的块会被
+        # 误记成「曾进入规范链」，导致标记与审计清单无法对账。
+        if not replaced_set:
+            self._apply_statuses(view.statuses)
+            self._store.mark_ever_canonical(adopted_set)
+            if view.tip_height >= 0:
+                self._store.advance_progress(view.tip_height)
             return 0
-        if tip is not None and depth > self._config.max_reorg_depth:
+
+        # 真正的切换：旧规范块被换下去、分叉块被接纳。
+        fork_height = self._fork_height(old_canonical, new_canonical, view)
+        depth = len(replaced_set)
+        old_tip_height = max((h for blk_hash, h in view.heights.items()
+                              if blk_hash in old_canonical), default=-1)
+        old_tip_hash = next(
+            (blk_hash for blk_hash in old_canonical
+             if view.heights.get(blk_hash) == old_tip_height), "")
+
+        if depth > self._config.max_reorg_depth:
             raise ReorgTooDeepError(
                 f"重组深度 {depth} 超过上限 {self._config.max_reorg_depth}，拒绝摄取",
-                detail={"block_hash": blk.block_hash, "depth": depth,
+                detail={"block_hash": trigger_hash, "depth": depth,
                         "max_reorg_depth": self._config.max_reorg_depth},
             )
 
-        # 旧规范链分叉点以上 -> REORGED（这些正是被「换下去」的块）
-        replaced: list[str] = []
-        if tip is not None:
-            for h in range(fork_height + 1, tip.height + 1):
-                for old in self._store.blocks_at_height(h, BlockStatus.CANONICAL):
-                    self._store.set_block_status(old.block_hash, BlockStatus.REORGED)
-                    replaced.append(old.block_hash)
-        # 新链 -> CANONICAL。readopted 只包含此前确实上过规范链、已被换为
-        # REORGED 的块：
-        #   - 直接状态为 REORGED 的块（如回归的 a1..a3）；
-        #   - 搭在 REORGED 块之上的 STAGED 延伸块（如 a4）——其根是回归链；
-        # 全新分叉首次胜出时其上的 STAGED 块（b1..b3）不属于重新接纳。
+        # replaced：本次真正 CANONICAL -> REORGED 的块（高度升序）。
+        replaced = sorted(replaced_set,
+                          key=lambda h: view.heights.get(h, -1))
+
+        # readopted：本次回到规范链的块中，除触发块外的部分。
+        # 触发块是审计记录的新链尖（全局重算下真正让新链胜出的可能是先
+        # 暂存、后因别的块补齐父链而连通的块），而非本次新投递的块。
+        # 是否属于「重新接纳」由持久化的 ever_canonical 历史标记判定，
+        # 而不是当前状态——全新分叉首次胜出时，落败段在新口径下落库即为
+        # REORGED，但它们从未上过规范链（ever_canonical=0），不算重新接纳。
+        # 获胜段最低处的块 ever_canonical=1 即说明本段建在曾被换下去的
+        # 回归链上，此时回归旧块与先于触发块到达的暂存延伸块都计入。
         readopted: list[str] = []
-        for b in chain:
-            if b.block_hash == blk.block_hash:
-                self._store.set_block_status(b.block_hash, BlockStatus.CANONICAL)
-                continue
-            old_entry = self._store.get_block(b.block_hash)
-            assert old_entry is not None
-            if old_entry[1] == BlockStatus.REORGED:
-                readopted.append(b.block_hash)
-            elif old_entry[1] == BlockStatus.STAGED:
-                base_entry = self._store.get_block(b.parent_hash)
-                if base_entry is not None \
-                        and base_entry[1] == BlockStatus.REORGED:
-                    readopted.append(b.block_hash)
-            self._store.set_block_status(b.block_hash, BlockStatus.CANONICAL)
+        assert view.tip_hash is not None
+        adopted_others = adopted_set - {view.tip_hash}
+        if adopted_others:
+            heights = view.heights
+            first_adopted = min(adopted_others, key=lambda h: heights[h])
+            if self._store.ever_canonical(first_adopted):
+                readopted = sorted(adopted_others,
+                                   key=lambda h: heights[h])
 
-        self._store.advance_progress(blk.height)
+        self._apply_statuses(view.statuses)
+        # 只标记本次新进入规范链的块；被换下的旧块标记保留（不可逆），
+        # 这正是「曾被换下去」与「从未进入规范链」的权威区分。
+        self._store.mark_ever_canonical(adopted_set)
+        self._store.advance_progress(view.tip_height)
 
-        # 仅在确实发生了规范链切换时落审计（初始建链无切换、不记账）
-        if tip is not None:
-            self._store.insert_reorg_audit(ReorgAuditRecord(
-                id=0,
-                created_at_ns=time.time_ns(),
-                trigger_block_hash=blk.block_hash,
-                fork_height=fork_height,
-                depth=depth,
-                old_tip_hash=tip.block_hash,
-                old_tip_height=tip.height,
-                new_tip_hash=blk.block_hash,
-                new_tip_height=blk.height,
-                replaced_blocks=tuple(sorted(replaced)),
-                readopted_blocks=tuple(sorted(readopted)),
-            ))
+        assert view.tip_hash is not None
+        # 触发块如实记录为本次切换后的规范链尖：全局重算下真正让新链连通
+        # 胜出的可能是先暂存、后因别的块补齐父链而连通的块（见审计测试）。
+        self._store.insert_reorg_audit(ReorgAuditRecord(
+            id=0,
+            created_at_ns=time.time_ns(),
+            trigger_block_hash=view.tip_hash,
+            fork_height=fork_height,
+            depth=depth,
+            old_tip_hash=old_tip_hash,
+            old_tip_height=old_tip_height,
+            new_tip_hash=view.tip_hash,
+            new_tip_height=view.tip_height,
+            replaced_blocks=tuple(replaced),
+            readopted_blocks=tuple(readopted),
+        ))
         return depth
 
-    def _try_connect_children(self, parent_hash: str) -> int:
-        """父块到位后，尝试连接挂在其下的暂存子树；返回累计最大重组深度。
+    @staticmethod
+    def _fork_height(old_canonical: set[str], new_canonical: set[str],
+                     view) -> int:
+        """两条规范链共同祖先的最高高度（无共同块时为 -1）。"""
+        common = old_canonical & new_canonical
+        return max((view.heights[h] for h in common), default=-1)
 
-        先按高度降序收集整棵暂存子树，再从最深块依次判定，使规范链切换由
-        该分叉上真正最深的链尖触发（例如 b4 到位时由 b4 而非 b1 触发重组），
-        避免只提升到中间块、把更新的块遗留在 STAGED。
-        """
-        staged: list[Block] = []
-
-        def collect(hash_: str) -> None:
-            for child_hash in self._store.children_of(hash_):
-                entry = self._store.get_block(child_hash)
-                assert entry is not None
-                child, status = entry
-                if status != BlockStatus.STAGED:
-                    continue
-                parent_entry = self._store.get_block(child.parent_hash)
-                if parent_entry is None \
-                        or parent_entry[0].height + 1 != child.height:
-                    continue  # 高度与父块不自洽，保持暂存，不静默入库
-                staged.append(child)
-                collect(child_hash)
-
-        collect(parent_hash)
-        max_depth = 0
-        for child in sorted(staged, key=lambda b: b.height, reverse=True):
-            refreshed = self._store.get_block(child.block_hash)
-            if refreshed is not None and refreshed[1] == BlockStatus.STAGED:
-                max_depth = max(max_depth, self._connect(child.block_hash))
-        return max_depth
+    def _apply_statuses(self, statuses: dict[str, BlockStatus]) -> None:
+        for block_hash, status in statuses.items():
+            current = self._store.get_block(block_hash)
+            assert current is not None
+            if current[1] != status:
+                self._store.set_block_status(block_hash, status)
 
     # ---- 对外入口 ----
     def ingest_block(self, block: Block) -> IngestResult:
@@ -248,7 +232,6 @@ class IngestService:
             # 重复投递：幂等返回当前状态，不写新数据
             return IngestResult(block.block_hash, existing[1], applied=False)
 
-        parent = self._store.get_block(block.parent_hash)
         if block.height == 0:
             if (self._config.genesis_hash
                     and block.block_hash != self._config.genesis_hash):
@@ -257,10 +240,17 @@ class IngestService:
                     detail={"block_hash": block.block_hash,
                             "expected": self._config.genesis_hash},
                 )
-        elif parent is None:
-            self._store.upsert_block(block, BlockStatus.STAGED)
-            return IngestResult(block.block_hash, BlockStatus.STAGED, applied=True)
         else:
+            parent = self._store.get_block(block.parent_hash)
+            if parent is None:
+                # 父块缺失：先落库为暂存块，再做一次全量重算（它带来的
+                # 其它子树状态不变；它自身因不连通仍为 STAGED）。
+                self._store.upsert_block(block, BlockStatus.STAGED)
+                depth = self._reclassify(block.block_hash)
+                final_status = self._store.get_block(
+                    block.block_hash)[1]  # type: ignore[index]
+                return IngestResult(block.block_hash, final_status,
+                                    applied=True, reorg_depth=depth)
             if parent[0].height + 1 != block.height:
                 raise MalformedPayloadError(
                     "区块高度与父块不连续",
@@ -269,9 +259,10 @@ class IngestService:
                             "parent_height": parent[0].height},
                 )
 
+        # 新块以 STAGED 落库后，在全量拓扑上统一重算三态与规范链切换；
+        # 结论只取决于最终区块集合，与投递顺序/并发度无关。
         self._store.upsert_block(block, BlockStatus.STAGED)
-        depth = self._connect(block.block_hash)
-        depth = max(depth, self._try_connect_children(block.block_hash))
+        depth = self._reclassify(block.block_hash)
         final_status = self._store.get_block(block.block_hash)[1]  # type: ignore[index]
         return IngestResult(block.block_hash, final_status,
                             applied=True, reorg_depth=depth)

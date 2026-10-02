@@ -24,10 +24,13 @@ indexer/
   errors.py          失败分类：malformed_payload / source_unavailable /
                      state_conflict / reorg_too_deep / lock_timeout /
                      storage_error
-  store.py           SQLite 存储（区块、交易、状态、进度、重组审计），
-                     写锁 + 事务（支持保存点嵌套、锁等待超时、一致性快照）
-  service.py         摄取、暂存连接、规范链维护、重组、审计、整批原子摄取
-  health.py          HealthChecker：只读分项自检
+  store.py           SQLite 存储（区块、交易、状态、进度、ever_canonical
+                     历史标记、重组审计），写锁 + 事务（保存点嵌套、
+                     锁等待超时、一致性快照）
+  topology.py        classify_blocks：顺序无关的确定性三态拓扑判定，
+                     service/health/查询共用同一口径
+  service.py         摄取、全量拓扑重算、规范链维护、重组、审计、整批原子摄取
+  health.py          HealthChecker：只读分项自检（含三态口径与审计对账）
   source.py          LocalChainSource：本地固定 JSON 数据源
 tests/               重组/重复/乱序/并发/畸形/回退 + 审计/自检/整批原子测试
 ```
@@ -63,20 +66,37 @@ tests/               重组/重复/乱序/并发/畸形/回退 + 审计/自检/�
 
 - **幂等**：同一区块（哈希与内容完全一致）重复投递返回 `applied=false`，
   不产生重复记录；同哈希不同内容属于状态冲突，拒绝且不覆盖原记录。
-- **乱序与暂存**：父块缺失的区块以 `staged` 状态保留（不丢弃、不进入规范
-  数据）；父块到位后自动递归连接。已连通但高度未超过规范链尖端的分叉块
-  同样保持 `staged`。
+- **乱序与暂存**：父块缺失（或与父块高度不连续）的区块以 `staged` 状态
+  保留（不丢弃、不进入规范数据）；父块到位、整棵子树连通到创世块后自动
+  参与统一拓扑判定。**已连通到创世块但输掉竞争的分叉块是 `reorged`**，
+  不是 `staged`——三态是只取决于最终区块集合的结构结论，不随投递时机变化。
 - **校验**：负高度/时间戳/金额/nonce、空哈希、区块内交易重复、交易归属
   与区块不一致、高度与父块不连续、创世块哈希与配置不符，均按畸形数据拒绝。
 
 ## 规范链与重组规则
 
-- 规范链始终选择**已连通到创世块**的链中高度最高者；未连通的链不会被提升。
-- 区块状态三分类，查询可区分：
+- 规范链始终从**已连通到创世块**的链中，按确定性规则选出唯一一条：
+  **链尖高度最高；同高时取链尖区块哈希字典序最小**。规则只依赖「最终
+  已落库的区块集合」，与区块的投递顺序、并发度无关，因此同一份数据无论
+  怎么乱序、重复、并发投递，最终结论完全一致、可复现。未连通到创世块的
+  链不会被提升。
+- 区块状态三分类，查询可区分，且**顺序无关、口径唯一**：
   - `canonical`：当前规范链上的区块；
-  - `reorged`：曾被纳入规范链、后被重组替换（其交易随区块一并失去规范归属，
-    记录保留可审计）；
-  - `staged`：父块缺失未连通，或已连通但暂未胜出的分叉块。
+  - `reorged`：祖先链已连通到创世块、但不在规范链上的分叉块。它内部有
+    两个可复查的**历史**细分（当前三态相同，靠 `ever_canonical` 标记与
+    重组审计区分，二者严格对账、永不矛盾）：
+    - **曾被换下去**：曾经进入过规范链（`ever_canonical=1`），后在某次
+      切换中被换下——必然能在某条审计的 `replaced_blocks` 里找到，且其
+      最后一次审计事件是「被换下」；
+    - **从未进入规范链**：连通到创世块时竞争已经落败，从未上过规范链
+      （`ever_canonical=0`）——从不出现在任何 `replaced/readopted` 清单中；
+  - `staged`：祖先链**无法**连通到创世块的块（父块缺失，或与父块高度不
+    连续）。注意：「已连通但输掉竞争」的块一律是 `reorged` 而非 `staged`，
+    这正是此前乱序/并发下归类时红时绿的根因，现已收敛为结构判定。
+- 实现、查询、自检、审计共用同一份确定性拓扑判定
+  （`indexer/topology.py::classify_blocks`）：每次写入后在全量区块集合上
+  重算三态；自检的 `status_classification` 分项会把存储状态与这份口径
+  逐项比对，任何不一致都会点名具体区块。
 - 重组触发时，被替换的规范区块在**同一事务**内标记为 `reorged`，新链区块
   标记为 `canonical`，并推进进度；任一步失败整体回滚，无部分应用。
 - **重组深度上限**：`max_reorg_depth`（默认 6）。胜出所需替换深度超过上限时，
@@ -100,15 +120,23 @@ tests/               重组/重复/乱序/并发/畸形/回退 + 审计/自检/�
 | `trigger_block_hash` | 触发本次切换的区块 |
 | `fork_height` / `depth` | 分叉点（共同祖先）高度与切换深度（旧链被替换的区块数） |
 | `old_tip` / `new_tip` | 切换前/后的链尖哈希与高度 |
-| `replaced_blocks` | 本次被换下去的块（原 CANONICAL → REORGED，高度升序） |
-| `readopted_blocks` | 原本在分叉上、本次随胜出链**重新回到规范链**的块（含曾被换为 REORGED 的块，以及搭在回归链上的暂存延伸块；本次新投递的触发块不计入） |
+| `replaced_blocks` | 本次被换下去的块（切换前 CANONICAL、切换后 REORGED，高度升序） |
+| `readopted_blocks` | 本次重新回到规范链的块（切换前非规范、切换后 CANONICAL，高度升序；触发块即新链尖不计入）。仅当获胜段建在**曾经上过规范链**的回归链上时非空；全新分叉首次胜出时为空 |
 
 一致性保证：
 
 - **与状态切换同生共死**：审计与区块状态翻转、进度推进在一个事务里；切换
   因重组过深或任一步失败而回滚时，审计也一并回滚，不会留下「无对应切换」的记录。
-- **重复投递不凭空记账**：初始建链、规范链正常延伸、同一区块/同一数据集
-  重复投递都不构成切换，不产生新记录（幂等返回 `applied=false`）。
+- **重复投递不凭空记账**：初始建链、规范链正常延伸、**落败分叉连通**、
+  同一区块/同一数据集重复投递都不构成切换，不产生新记录（幂等返回
+  `applied=false`）。只有「旧规范块被真正换下」才落一条记录。
+- **与最终三态严格对账**：按时间正序回放每条审计的两份清单，每个块「最后
+  一次被提到」的方向必须与其最终状态一致——最后是 `replaced` 的块最终必为
+  `reorged`，最后是 `readopted` 的块最终必为 `canonical`；同一条记录里
+  同一块不会既被换下又被接纳。自检的 `audit_reconciliation` 分项持续守护
+  这套对账，任何「审计与最终状态各执一词」的块都会被点名。
+- 「曾被换下去」的块一定在某条 `replaced_blocks` 中且 `ever_canonical=1`；
+  「从未进入规范链」的连通落败块 `ever_canonical=0`、从不出现在任何清单中。
 - 记录**只追加**，通过 `GET /reorgs/audits?limit=&offset=` 按时间倒序翻查。
 
 ```bash
@@ -131,7 +159,7 @@ curl -s http://127.0.0.1:8000/reorgs/audits?limit=20 | jq
 }
 ```
 
-四个分项：
+六个分项：
 
 | 检查项 | 检查内容 |
 | --- | --- |
@@ -139,14 +167,19 @@ curl -s http://127.0.0.1:8000/reorgs/audits?limit=20 | jq
 | `block_parent_consistency` | 每个块的状态是否与父链对得上（规范块父块必须规范、缺父块只能是 staged、高度须相邻） |
 | `canonical_txs` | 规范链交易是否归属正确、有无重复、有无悬空（归属块不存在） |
 | `progress` | 记录进度是否与当前规范链尖高度一致 |
+| `status_classification` | 存储三态是否与顺序无关的统一拓扑口径逐项一致；`ever_canonical` 历史标记是否自洽 |
+| `audit_reconciliation` | 审计 `replaced/readopted` 清单正序回放后是否与最终三态对得上，有无互相矛盾的块 |
 
 有问题时不是只回一个对/错，而是在 `issues` 里点名**具体的 `block_hashes` /
 `tx_hashes`** 及可读说明。检查全程**只读**：
 
 - 不执行任何写入，重复调用不改变数据（有 `test_health_is_read_only` 守护）。
-- 快照在与写入事务**互斥的存储锁**内一次性取齐区块、交易、进度三张表，因此
-  并发摄取过程中调用自检，只会看到写前或写后的完整状态，读不到改了一半的
-  中间状态（有 `test_health_never_reads_half_written_state` 守护）。
+- 快照在与写入事务**互斥的存储锁**内一次性取齐区块、交易、进度、审计四张表，
+  因此并发摄取过程中调用自检，只会看到写前或写后的完整状态，读不到改了一半
+  的中间状态。`test_health_never_reads_half_written_state` 用**真实生效的
+  连续链写入**（每块都提交成功、断言写入数量，杜绝「写入全被拒的空转」）与
+  自检线程长时间并发，断言每份报告六项全过、观察到的进度只可能是某个已提交
+  完整前缀（写前或写后），并确实观察到了写入后的最终状态。
 - HTTP 始终返回 200，由响应体 `ok` 区分自洽与否（自检动作本身成功执行）。
 
 ## 整批原子摄取
@@ -193,49 +226,83 @@ curl -s http://127.0.0.1:8000/reorgs/audits?limit=20 | jq
 
 ## 兼容性
 
-- **已有数据**：新增的 `reorg_audits` 表通过 `CREATE TABLE IF NOT EXISTS`
-  幂等建表，打开旧库会自动补齐，不影响已有的 `blocks`/`txs`/`progress`
-  数据与查询结果。升级前产生的历史切换没有审计记录（表从升级后开始记录），
-  不影响索引一致性。
+- **已有数据**：`reorg_audits` 表与 `blocks.ever_canonical` 列均通过
+  幂等 DDL（`CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ... ADD COLUMN`，
+  已存在则跳过）在打开旧库时自动补齐，不改动、不删除已有
+  `blocks`/`txs`/`progress` 数据。升级前产生的历史切换没有审计记录，
+  旧块的 `ever_canonical` 默认为 0；自检不会因此误报。
 - **原有接口**：`/ingest/block`、`/ingest/blocks`、`/ingest/from-source`、
-  `/blocks`、`/chain/canonical`、`/progress` 的路径、请求/响应结构与语义
-  全部保持不变；新增能力走**独立的新路径**（`/ingest/blocks/atomic`、
-  `/reorgs/audits`、`/health`），不改动老调用方。
-- 区块三状态（canonical/reorged/staged）的定义与原文档一致；新表、新错误
-  分类（`lock_timeout`、`storage_error`）均为纯增量。
+  `/blocks`、`/chain/canonical`、`/progress` 的路径、请求/响应结构与
+  查询语义全部保持不变；`/health`、`/reorgs/audits` 的既有字段不变
+  （`/health` 的 `checks` 为纯追加两个分项）。
+- **三态语义收敛**：`canonical/reorged/staged` 三个枚举值与查询入口不变；
+  变化的只是 `reorged` 与 `staged` 的**判定口径**——从「依赖投递时机」收敛
+  为「只取决于最终区块集合」的结构判定：已连通到创世块但输掉竞争的分叉块，
+  此前在某些投递顺序下会被记为 `staged`，此后一律确定为 `reorged`。其
+  「曾被换下去 / 从未进入规范链」的历史区分由 `ever_canonical` 标记与
+  审计清单承担，接口不新增字段即可复查。
 
 ## 运行与验证
 
 ```bash
 uv sync                                   # 安装依赖
 uv run uvicorn main:app --reload          # 启动服务
-uv run pytest tests/ -v                   # 运行测试（日志打印输入与判定依据）
+uv run pytest tests/ -v                   # 运行测试（日志打印每个用例的输入与判定依据）
 ```
 
-本地手工验证新能力：
+本地手工验证：
 
 ```bash
 # 1) 整批原子摄取主链
 curl -s -X POST localhost:8000/ingest/blocks/atomic -H 'content-type: application/json' \
   -d '{"blocks":[ ... ]}'
-# 2) 触发一次重组后，按时间倒序查看切换审计
+# 2) 触发一次重组后，按时间倒序查看切换审计（replaced/readopted 两份清单）
 curl -s localhost:8000/reorgs/audits | jq
-# 3) 随时做只读自检（分项 ok 与问题清单）
+# 3) 随时做只读自检（六个分项 ok 与问题清单）
 curl -s localhost:8000/health | jq
 ```
 
-测试覆盖：在既有的乱序/重复投递、重组切换与状态区分、过深重组拒绝、畸形
-负载、进度回退、并发摄取不重不漏、数据源不可用与畸形分类之外，新增：
+### 本地复现稳定性结论的步骤
 
-- `tests/test_audit.py`：切换审计字段如实、初始建链/正常延伸不记账、切换
-  失败（过深拒绝 / 审计写入注入失败）整体回滚不留记录、重复投递不重复记账、
-  被换下去的块随分叉反超回归时 `readopted_blocks` 如实反映、审计倒序分页。
-- `tests/test_health.py`：健康索引四项全过；人为破坏规范链连续性、进度、
-  交易归属时给出点名具体块/交易的问题清单；自检只读；并发摄取期间读不到
-  改了一半的中间状态。
+```bash
+# A) 全套测试一次性运行（70 个用例），日志含输入与判定依据
+uv run pytest tests/ -v
+
+# B) 把既有重组/乱序/并发/进度回退用例连着多轮复跑（下面为 20 轮），
+#    确认最终三态不再时好时坏：
+for i in $(seq 1 20); do
+  uv run pytest tests/test_concurrency.py tests/test_ingest.py \
+                tests/test_errors.py tests/test_audit.py -q | tail -1
+done
+
+# C) 顺序无关 + 多随机种子/多并发度（10 种子 × 1/4/16 线程 = 30 个参数组合）：
+uv run pytest tests/test_determinism.py -v
+
+# D) 写入进行中自检始终自洽（真实生效写入并发，非空转）：
+uv run pytest tests/test_health.py::test_health_never_reads_half_written_state -v
+```
+
+期望结果：A 全部通过；B 每轮都为「全部 passed」，并发用例中输掉的 a 链
+稳定归类为 `reorged`；C 每种种子/线程数下规范链均为 `g0,b1..b4`、
+`a1..a3` 均为 `reorged`；D 日志显示 40 块全部生效、期间每份自检报告
+`ok=true`，且观察到的进度是从 3 到 43 的若干完整状态。
+
+测试覆盖：在既有的乱序/重复投递、重组切换与状态区分、过深重组拒绝、畸形
+负载、进度回退、并发摄取不重不漏、数据源不可用与畸形分类之外，新增/加固：
+
+- `tests/test_determinism.py`：多种投递顺序下最终三态严格一致；10 随机
+  种子 × 3 种并发度的乱序重复投递结论稳定可复现；「曾被换下去」与「从未
+  进入规范链」在状态、`ever_canonical`、审计清单三处口径一致；人为制造
+  审计/状态矛盾时自检 `audit_reconciliation` 点名具体块。
+- `tests/test_audit.py`：切换审计字段如实、初始建链/正常延伸/落败分叉连通
+  不记账、切换失败（过深拒绝 / 审计写入注入失败）整体回滚不留记录、重复
+  投递不重复记账、分叉反超回归时 `readopted_blocks` 如实反映、倒序分页。
+- `tests/test_health.py`：健康索引六项全过；人为破坏连续性、进度、交易
+  归属时点名具体块/交易；自检只读；**真实生效写入并发**期间每份自检都自洽、
+  只能看到写前/写后完整状态（断言写入数量，杜绝空转）。
 - `tests/test_batch.py`：整批原子摄取在畸形块/重组过深时整体不留数据、
   整批合法一次生效、批内重复幂等计入 duplicates、等锁超时返回可区分可重试
   的 `lock_timeout` 且不卡死。
-- `tests/test_source_api.py`：新增三个 HTTP 端点的端到端行为。
+- `tests/test_source_api.py`：三个 HTTP 端点的端到端行为。
 
 测试日志通过 `log_cli` 输出每个用例的输入与判定依据。

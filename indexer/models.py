@@ -6,11 +6,14 @@ import enum
 from dataclasses import dataclass, field
 
 class BlockStatus(str, enum.Enum):
-    """区块在索引中的三类可区分状态。"""
+    """区块在索引中的三类状态（顺序无关的结构判定，见 indexer.topology）。"""
 
-    CANONICAL = "canonical"   # 规范链上的区块
-    REORGED = "reorged"       # 曾被纳入规范链、后被重组替换
-    STAGED = "staged"         # 父块缺失、未连通，暂存待连接
+    CANONICAL = "canonical"   # 当前规范链上的区块
+    REORGED = "reorged"       # 已连通到创世块但输掉竞争的分叉块
+    #   历史细分（当前三态相同，靠 blocks.ever_canonical 与审计区分）：
+    #   ever_canonical=1：曾进入规范链、后被换下（审计 replaced 可查）；
+    #   ever_canonical=0：连通时即落败、从未进入规范链（不在任何审计清单）。
+    STAGED = "staged"         # 祖先链无法连通到创世块（缺父块/高度不连续）
 
 
 @dataclass(frozen=True)
@@ -76,6 +79,7 @@ class BlockSnapshot:
     parent_hash: str
     height: int
     status: BlockStatus
+    ever_canonical: bool = False   # 是否曾经进入过规范链（历史标记，不可逆）
 
 
 @dataclass(frozen=True)
@@ -85,3 +89,4 @@ class StoreSnapshot:
     blocks: tuple[BlockSnapshot, ...]
     txs: tuple[Transaction, ...]
     progress: int
+    audits: tuple[ReorgAuditRecord, ...] = ()

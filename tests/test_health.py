@@ -14,7 +14,8 @@ log = logging.getLogger("test")
 
 
 def _checker(service) -> HealthChecker:
-    return HealthChecker(service._store)
+    return HealthChecker(service._store,
+                         genesis_hash=service._config.genesis_hash)
 
 
 def _healthy_chain(service):
@@ -31,7 +32,8 @@ def test_health_clean_chain_passes(service):
     assert report.ok
     assert {c.name for c in report.checks} == {
         "canonical_continuity", "block_parent_consistency",
-        "canonical_txs", "progress"}
+        "canonical_txs", "progress",
+        "status_classification", "audit_reconciliation"}
     assert report.issues == ()
 
 
@@ -111,39 +113,72 @@ def test_health_is_read_only(service):
 
 
 def test_health_never_reads_half_written_state(service):
-    """并发摄取期间做自检：要么看到写前、要么写后，绝不读到改了一半的状态。
+    """并发「生效写入」期间持续自检：每份报告都必须自洽，且只能落在
+    写前或写后的完整状态上——不允许空转通过。
 
-    自检与写入在同一把存储锁上互斥；在写入线程持锁期间多次自检，得到的
-    每份报告都必须是自洽的（ok=True），不会观察到中间破损态。
+    旧实现的问题：写入端构造的是 w{i}(parent=a3, height=4+i)，除第一块外
+    全部因「高度与父块不连续」被拒、异常还被吞掉，实际没有任何生效区块，
+    性质根本没被验证。这里写入端投递的是一条合法的连续链 a4..aN，每一块
+    都会真正提交生效；并用屏障确保自检与写入在时间上真实重叠，同时断言：
+
+    1) 期间确实有多块生效写入（不是全部被拒的空转）；
+    2) 每份报告 ok=True（六分项全自洽，读不到改了一半的中间态）；
+    3) 每份报告观察到的进度与规范链尖严格一致，且等于「已提交区块数」
+       对应的某个完整前缀（写前/写后两个完整状态之一）。
     """
-    _healthy_chain(service)
+    import time
+
+    from .conftest import make_block
+
+    _healthy_chain(service)  # g0..a3，进度 3
     store = service._store
-    stop = threading.Event()
-    reports: list[bool] = []
+    n_writes = 40
+    written = {"count": 0}
+    write_lock = threading.Lock()
+    done = threading.Event()
 
     def writer():
-        # 持锁时间内反复在同一事务里制造“先改后回”的动作，拉长临界区
-        from .conftest import make_block
-        i = 0
-        while not stop.is_set():
-            i += 1
-            try:
-                service.ingest_block(make_block(f"w{i}", "a3", 4 + i))
-            except Exception:
-                pass
+        for i in range(4, 4 + n_writes):
+            blk = make_block(f"a{i}", f"a{i - 1}", i)  # 合法连续链，必生效
+            r = service.ingest_block(blk)
+            assert r.applied, f"生效写入意外被拒: {r}"
+            with write_lock:
+                written["count"] += 1
+            # 让出调度，制造与自检线程真实交替的窗口
+            time.sleep(0.002)
+        done.set()
+
+    observations: list[tuple[bool, int]] = []
+    observed_progress: set[int] = set()
 
     def checker():
-        while not stop.is_set():
-            # 快照在锁保护下取得：与任何写入互斥，报告必然自洽
-            reports.append(_checker(service).run_checks().ok)
+        while not done.is_set():
+            report = _checker(service).run_checks()
+            prog = store.get_progress()
+            observations.append((report.ok, prog))
+            observed_progress.add(prog)
 
     tw = threading.Thread(target=writer)
     tc = threading.Thread(target=checker)
     tw.start(); tc.start()
-    stop.wait(0.4)
-    stop.set()
     tw.join(); tc.join()
 
-    log.info("判定依据: 并发期间完成 %d 份自检，全部自洽", len(reports))
-    assert reports, "应至少完成一份自检"
-    assert all(reports), "自检读到了改了一半的中间状态"
+    # 1) 非空转：全部写入都真实生效
+    log.info("判定依据: 生效写入 %d/%d 块，并发期间完成 %d 份自检",
+             written["count"], n_writes, len(observations))
+    assert written["count"] == n_writes, "写入端必须全部生效，不能靠被拒空转"
+
+    # 2) 每份报告都自洽（包含拓扑口径与审计对账两项新增检查）
+    assert observations, "应至少完成一份自检"
+    bad = [p for ok, p in observations if not ok]
+    assert not bad, f"有 {len(bad)} 份自检读到了不自洽的中间状态: {bad[:5]}"
+
+    # 3) 每份结论对应写前或写后的完整状态：进度只能是 3..3+N 的某个已提交
+    #    前缀高度，且该高度与规范链严格一致（由 progress 分项保证）。
+    assert all(3 <= p <= 3 + n_writes for _, p in observations)
+    # 必须真实观察到过「写入后」的前进状态，证明确实与生效写入并发
+    assert max(observed_progress) == 3 + n_writes, \
+        f"自检未观察到最终完整状态，仅到 {max(observed_progress)}"
+    assert len(observed_progress) > 1, "自检未与任何生效写入在时间上重叠"
+    log.info("判定依据: %d 份自检全部自洽，观察到的完整状态进度集合=%s",
+             len(observations), sorted(observed_progress))
