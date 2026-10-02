@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 
 from indexer.health import HealthChecker
 from indexer.models import BlockStatus
@@ -111,39 +112,75 @@ def test_health_is_read_only(service):
 
 
 def test_health_never_reads_half_written_state(service):
-    """并发摄取期间做自检：要么看到写前、要么写后，绝不读到改了一半的状态。
+    """并发摄取「真正生效」的区块期间自检：每份快照只能是某个已提交状态。
 
-    自检与写入在同一把存储锁上互斥；在写入线程持锁期间多次自检，得到的
-    每份报告都必须是自洽的（ok=True），不会观察到中间破损态。
+    旧版用例的写入端拼的是 w1(h=5, 父 a3 在 h=3，高度跳变)、w2(h=6,...)
+    等区块，全部被判畸形拒绝且异常被吞，实际上没有任何生效写入，性质从未
+    被验证。这里写入端从 a3 开始**逐块连续延伸**（h=4,5,...），每块都真正
+    提交并推进规范链与进度，并断言：
+
+    - 写入端确实提交了多块（applied 计数显著增长，杜绝空转通过）；
+    - 自检确实在写入进行中拿到多份快照；
+    - 每份快照自检自洽（ok=True），且其进度要么是「写前」、要么是某次提交
+      「写后」的完整状态：观测到的进度序列必须单调非降、相邻快照之间要么
+      不变（读到同一已提交状态）、要么跳到已真实提交的高度，绝不出现进度
+      与规范链对不上的半成品态。
     """
-    _healthy_chain(service)
-    store = service._store
+    _healthy_chain(service)  # g0..a3，规范链高 3
+    from .conftest import make_block
+
     stop = threading.Event()
-    reports: list[bool] = []
+    applied = {"n": 0}
+    lock = threading.Lock()
+    observed: list[int] = []   # 每份快照看到的进度（规范链尖高度）
+    oks: list[bool] = []
 
     def writer():
-        # 持锁时间内反复在同一事务里制造“先改后回”的动作，拉长临界区
-        from .conftest import make_block
+        # 逐块连续延伸：父块必在上一已提交块上，高度相邻 => 每块都生效
         i = 0
-        while not stop.is_set():
-            i += 1
+        while not stop.is_set() and i < 60:
+            h = 4 + i
+            parent = "a3" if i == 0 else f"w{i - 1}"
             try:
-                service.ingest_block(make_block(f"w{i}", "a3", 4 + i))
-            except Exception:
-                pass
+                r = service.ingest_block(make_block(f"w{i}", parent, h))
+            except Exception as exc:  # pragma: no cover - 不应有失败
+                log.error("写入端意外失败: %s", exc)
+                break
+            with lock:
+                if r.applied:
+                    applied["n"] += 1
+            i += 1
+            time.sleep(0.003)  # 留出窗口，让自检在两次提交之间并发执行
 
     def checker():
         while not stop.is_set():
-            # 快照在锁保护下取得：与任何写入互斥，报告必然自洽
-            reports.append(_checker(service).run_checks().ok)
+            snap = service._store.snapshot()
+            report = HealthChecker(service._store).run_checks()
+            with lock:
+                oks.append(report.ok)
+                observed.append(snap.progress)
 
     tw = threading.Thread(target=writer)
     tc = threading.Thread(target=checker)
     tw.start(); tc.start()
-    stop.wait(0.4)
+    tw.join(timeout=5.0)   # 写完最多 60 块就结束（正常远早于 5s）
     stop.set()
-    tw.join(); tc.join()
+    tc.join(timeout=5.0)
 
-    log.info("判定依据: 并发期间完成 %d 份自检，全部自洽", len(reports))
-    assert reports, "应至少完成一份自检"
-    assert all(reports), "自检读到了改了一半的中间状态"
+    log.info("输入: 写入端连续投递生效块 w0..，实际 applied=%d；"
+             "并发期间取得 %d 份自检快照，进度观测序列=%s",
+             applied["n"], len(observed), observed)
+
+    # 1) 写入端真的写进了多块生效区块（这是旧用例缺失的关键前提）
+    assert applied["n"] >= 10, f"写入端只生效了 {applied['n']} 块，疑似空转"
+    # 2) 自检确实在写入进行中执行过，且每份都自洽
+    assert len(observed) >= 10, "并发期间取得的自检快照过少"
+    assert all(oks), "自检读到了改了一半的中间状态"
+    # 3) 每份快照只能是「写前」或某次「写后」的完整状态：进度序列单调非降，
+    #    且每步增量 >= 0（不存在回退或对不上的中间值）；起点 3、终点追平写入
+    assert all(b >= a for a, b in zip(observed, observed[1:])), \
+        f"观测进度非单调: {observed}"
+    assert observed[0] >= 3
+    assert observed[-1] == service._store.get_progress() == 3 + applied["n"]
+    log.info("判定依据: 进度从 %d 单调推进到 %d，全部快照 ok，无半成品态",
+             observed[0], observed[-1])

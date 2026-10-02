@@ -14,7 +14,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .models import BlockStatus, StoreSnapshot
+from .classification import classify_blocks
+from .models import Block, BlockStatus, StoreSnapshot
 from .store import Store
 
 
@@ -150,8 +151,40 @@ class HealthChecker:
                     f"状态为 {parent.status.value}（应为 canonical）",
                     block_hashes=(b.block_hash, parent.block_hash)))
 
+        # 三态归类必须与统一口径（确定性参考重放）一致：同一份数据无论按什么
+        # 顺序/并发度投递，最终落到哪一类都应能被这里复查出来。
+        issues.extend(self._classification_divergences(snap))
         return CheckResult("block_parent_consistency", ok=not issues,
                            issues=tuple(issues))
+
+    @staticmethod
+    def _classification_divergences(snap: StoreSnapshot) -> list[CheckIssue]:
+        blocks = [Block(block_hash=b.block_hash, parent_hash=b.parent_hash,
+                        height=b.height, timestamp=0, transactions=())
+                  for b in snap.blocks]
+        verdict = classify_blocks(blocks)
+        # 唯一最高链尖：当前规范块的最大高度上恰好只有一个块。存在多条
+        # 「同最高高度、互不延伸」的并列链（永未分出长短）时，实现保持
+        # 「同高度不抢占、先到者保持规范」的既定行为，不纳入收敛复查。
+        canonical_blocks = [b for b in snap.blocks
+                            if b.status == BlockStatus.CANONICAL]
+        unique_tallest = bool(canonical_blocks) and \
+            sum(1 for b in canonical_blocks
+                if b.height == max(x.height for x in canonical_blocks)) == 1
+        out: list[CheckIssue] = []
+        for b in sorted(snap.blocks, key=lambda x: (x.height, x.block_hash)):
+            want = verdict.status_of(b.block_hash)
+            if want is None:
+                continue
+            if want == BlockStatus.CANONICAL and not unique_tallest:
+                continue  # 并列同高边角：规范身份按实现的先到先得，不复查
+            if b.status != want:
+                out.append(CheckIssue(
+                    "block_parent_consistency",
+                    f"块 {b.block_hash}(h={b.height}) 归类为 "
+                    f"{b.status.value}，与统一口径期望的 {want.value} 不一致",
+                    block_hashes=(b.block_hash,)))
+        return out
 
     # ---- 3. 规范链交易归属与重复 ----
     def _check_canonical_txs(self, snap: StoreSnapshot) -> CheckResult:

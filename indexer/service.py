@@ -15,15 +15,19 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 
+from .classification import settle_to_reference
 from .config import IndexerConfig
 from .errors import (MalformedPayloadError, ReorgTooDeepError,
                      StateConflictError, StorageError)
 from .models import (BatchIngestResult, Block, BlockStatus, IngestResult,
                      ReorgAuditRecord)
 from .store import Store
+
+log = logging.getLogger("indexer")
 
 
 class IngestService:
@@ -120,11 +124,17 @@ class IngestService:
                 for old in self._store.blocks_at_height(h, BlockStatus.CANONICAL):
                     self._store.set_block_status(old.block_hash, BlockStatus.REORGED)
                     replaced.append(old.block_hash)
-        # 新链 -> CANONICAL。readopted 只包含此前确实上过规范链、已被换为
-        # REORGED 的块：
-        #   - 直接状态为 REORGED 的块（如回归的 a1..a3）；
-        #   - 搭在 REORGED 块之上的 STAGED 延伸块（如 a4）——其根是回归链；
-        # 全新分叉首次胜出时其上的 STAGED 块（b1..b3）不属于重新接纳。
+        # 新链 -> CANONICAL。readopted 只包含此前**真正上过**规范链、已被
+        # 真实切换换为 REORGED 的块：
+        #   - 真实切换历史里出现过的 REORGED 块（如回归的 a1..a3）；
+        #   - 搭在这种真 REORGED 块之上的 STAGED 延伸块（如 a4）；
+        # 仅按参考口径补判为 REORGED（实际顺序里从未规范过）的块不算；
+        # 全新分叉首次胜出时其上的 STAGED 块（b1..b3）也不算。
+        def genuinely_reorged(hash_: str) -> bool:
+            entry = self._store.get_block(hash_)
+            return (entry is not None and entry[1] == BlockStatus.REORGED
+                    and self._store.truly_was_canonical(hash_))
+
         readopted: list[str] = []
         for b in chain:
             if b.block_hash == blk.block_hash:
@@ -132,12 +142,14 @@ class IngestService:
                 continue
             old_entry = self._store.get_block(b.block_hash)
             assert old_entry is not None
-            if old_entry[1] == BlockStatus.REORGED:
+            # 真正上过规范链、后被真实切换换下的块（回归链本体）；
+            if genuinely_reorged(b.block_hash):
                 readopted.append(b.block_hash)
-            elif old_entry[1] == BlockStatus.STAGED:
+            else:
+                # 搭在真 REORGED 块之上的延伸块（全新投递或此前暂存，
+                # 可能已被参考口径补判为 REORGED）：根是回归链，随链回归。
                 base_entry = self._store.get_block(b.parent_hash)
-                if base_entry is not None \
-                        and base_entry[1] == BlockStatus.REORGED:
+                if base_entry is not None and genuinely_reorged(b.parent_hash):
                     readopted.append(b.block_hash)
             self._store.set_block_status(b.block_hash, BlockStatus.CANONICAL)
 
@@ -269,12 +281,34 @@ class IngestService:
                             "parent_height": parent[0].height},
                 )
 
+        # 先记录状态机即时判定结果（与审计同一时刻），供返回值使用；随后做
+        # 与投递顺序无关的补判收敛，返回值仍如实反映本次即时判定。
         self._store.upsert_block(block, BlockStatus.STAGED)
         depth = self._connect(block.block_hash)
         depth = max(depth, self._try_connect_children(block.block_hash))
-        final_status = self._store.get_block(block.block_hash)[1]  # type: ignore[index]
-        return IngestResult(block.block_hash, final_status,
+        immediate_status = self._store.get_block(block.block_hash)[1]  # type: ignore[index]
+        self._settle_to_reference(block.block_hash)
+        return IngestResult(block.block_hash, immediate_status,
                             applied=True, reorg_depth=depth)
+
+    def _settle_to_reference(self, trigger_hash: str) -> None:
+        """对当前全图做确定性参考重放，单调补判 STAGED -> REORGED。
+
+        收敛口径见 indexer.classification：落败分叉若在参考重放中「曾经领先」，
+        无论它实际何时连通，最终都应是 REORGED 而非 STAGED。真实发生过的
+        规范链切换已由状态机即时翻转并写审计，这里只补齐「实际顺序下从未登
+        上规范链、但参考口径下曾领先」的块，不改动任何 CANONICAL 块。
+        """
+        stored = self._store.list_blocks()
+        current = {b.block_hash: s for b, s in stored}
+        settled = settle_to_reference(
+            [b for b, _ in stored],
+            current,
+            lambda h, s: self._store.set_block_status(h, s),
+        )
+        if settled:
+            log.info("块 %s 摄取后按参考口径补判 STAGED->REORGED: %s",
+                     trigger_hash, list(settled))
 
     def canonical_chain(self) -> list[Block]:
         """按高度升序返回当前规范链。"""

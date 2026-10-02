@@ -308,6 +308,29 @@ class Store:
             return self._conn.execute(
                 "SELECT COUNT(*) AS n FROM reorg_audits").fetchone()["n"]
 
+    def truly_was_canonical(self, block_hash: str) -> bool:
+        """该块是否在**实际发生过的**规范链切换历史中真正上过规范链。
+
+        用来与「仅按参考口径补判为 REORGED、实际投递顺序中从未登上规范链」
+        的块做区分，避免补判块在后续真实切换里被误算进 readopted 名单。
+
+        判定依据是只追加、与状态翻转同事务的真实审计链：块只要出现在某条
+        审计的 replaced_blocks（那次切换前它确实在旧规范链上）或
+        readopted_blocks（它曾随某次切换真正回到规范链）中，就真正规范过。
+        参考补判不写审计，因此补判块永远不会出现在这两份名单里。
+
+        调用方须已持有存储锁/处于事务内（不再加锁，调用均在临界区深处）。
+        """
+        rows = self._conn.execute(
+            "SELECT replaced_blocks, readopted_blocks FROM reorg_audits"
+            " ORDER BY id ASC").fetchall()
+        for r in rows:
+            if block_hash in set(json.loads(r["replaced_blocks"])):
+                return True
+            if block_hash in set(json.loads(r["readopted_blocks"])):
+                return True
+        return False
+
     # ---- 只读一致性快照 ----
     def snapshot(self) -> StoreSnapshot:
         """在与写入互斥的临界区内一次性读出全量数据，供只读自检使用。

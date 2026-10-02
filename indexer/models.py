@@ -6,11 +6,12 @@ import enum
 from dataclasses import dataclass, field
 
 class BlockStatus(str, enum.Enum):
-    """区块在索引中的三类可区分状态。"""
+    """区块在索引中的三类可区分状态（判定口径见 indexer.classification）。"""
 
-    CANONICAL = "canonical"   # 规范链上的区块
-    REORGED = "reorged"       # 曾被纳入规范链、后被重组替换
-    STAGED = "staged"         # 父块缺失、未连通，暂存待连接
+    CANONICAL = "canonical"   # 当前规范链上的区块
+    REORGED = "reorged"       # 曾在规范链竞争中领先、最终落败（真实被换下
+                              # 或按统一参考口径补判；查询/自检/审计同口径）
+    STAGED = "staged"         # 父块缺失未连通，或已连通但从未领先的分叉块
 
 
 @dataclass(frozen=True)
